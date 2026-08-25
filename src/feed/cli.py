@@ -20,6 +20,7 @@ from .credentials import (
     _json_response,
     credential_control_url,
     fetch_projects,
+    project_reference,
     resolve_project,
 )
 from .errors import AuthError
@@ -46,6 +47,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     )
     projects.add_argument("--no-refresh", action="store_true")
 
+    use = subcommands.add_parser(
+        "use", help="select the default project for logging"
+    )
+    use.add_argument("project", help="project UUID, slug, or organization/slug")
+
     enable = subcommands.add_parser(
         "enable", help="enable the managed project catalog for querying"
     )
@@ -57,6 +63,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _login(args)
         if args.command == "projects":
             return _projects(not args.no_refresh)
+        if args.command == "use":
+            return _use(args.project)
         return _enable(args.project)
     except AuthError as exc:
         parser.exit(1, f"feed: {exc}\n")
@@ -120,18 +128,29 @@ def _login(args: argparse.Namespace) -> int:
         raise AuthError("authorization service returned an incomplete login response")
     project_records = fetch_projects(control_url, access_token)
 
-    CredentialStore().save(
-        {
-            "version": 1,
-            "control_url": control_url.rstrip("/"),
-            "server_url": server_url.rstrip("/"),
-            "device_guid": device_guid,
-            "refresh_token": refresh_token,
-            "projects": project_records,
-        }
+    default_project = (
+        str(project_records[0]["id"])
+        if len(project_records) == 1 and project_records[0].get("id")
+        else None
     )
+    credentials = {
+        "version": 1,
+        "control_url": control_url.rstrip("/"),
+        "server_url": server_url.rstrip("/"),
+        "device_guid": device_guid,
+        "refresh_token": refresh_token,
+        "projects": project_records,
+    }
+    if default_project is not None:
+        credentials["default_project"] = default_project
+    CredentialStore().save(credentials)
     print(f"Signed in. {len(project_records)} project(s) are available for logging.")
-    _print_projects(project_records)
+    _print_projects(project_records, default_project)
+    if default_project is not None:
+        print(
+            "Using the only available project by default: "
+            f"{project_reference(default_project, project_records)}"
+        )
     return 0
 
 
@@ -143,7 +162,43 @@ def _projects(refresh: bool) -> int:
         provider = TokenProvider(store)
         records = fetch_projects(credential_control_url(credentials), provider.token())
         store.update(lambda current: current.__setitem__("projects", records))
-    _print_projects(records)
+    _print_projects(records, credentials.get("default_project"))
+    return 0
+
+
+def _use(project: str) -> int:
+    store = CredentialStore()
+    credentials = store.load()
+    records = credentials.get("projects", [])
+    if not isinstance(records, list):
+        records = []
+
+    try:
+        project_id = resolve_project(project, records)
+    except AuthError as error:
+        if "ambiguous" in str(error):
+            raise
+        project_id = ""
+
+    if not any(
+        isinstance(record, dict) and record.get("id") == project_id
+        for record in records
+    ):
+        provider = TokenProvider(store)
+        records = fetch_projects(credential_control_url(credentials), provider.token())
+        project_id = resolve_project(project, records)
+        if not any(record.get("id") == project_id for record in records):
+            raise AuthError(
+                f"project {project!r} is not available for logging; run `feed projects`"
+            )
+
+    def select(current: Dict[str, Any]) -> None:
+        current["projects"] = records
+        current["default_project"] = project_id
+
+    store.update(select)
+    reference = project_reference(project_id, records)
+    print(f"Default Feed project: {reference}")
     return 0
 
 
@@ -165,14 +220,15 @@ def _enable(project: str) -> int:
     return 0
 
 
-def _print_projects(records: Any) -> None:
+def _print_projects(records: Any, default_project: Optional[str] = None) -> None:
     if not records:
         print("No projects with logging permission.")
         return
     for project in records:
         reference = f"{project['organization_slug']}/{project['slug']}"
         label = project.get("name") or project["slug"]
-        print(f"{reference}\t{label}\t{project['role']}")
+        selected = "\tdefault" if project.get("id") == default_project else ""
+        print(f"{reference}\t{label}\t{project['role']}{selected}")
 
 
 def _select_provider(control_url: str) -> str:

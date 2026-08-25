@@ -36,6 +36,7 @@ _CREDENTIAL_KEYS = {
     "device_guid",
     "refresh_token",
     "projects",
+    "default_project",
 }
 
 
@@ -196,11 +197,65 @@ def credential_control_url(credentials: Dict[str, Any]) -> str:
     raise AuthError("Feed credentials contain no control API URL")
 
 
+def select_project(
+    reference: Optional[str],
+    projects: Any,
+    default_project: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Select a project and return its UUID and user-facing reference."""
+
+    requested = str(reference or "").strip() or str(default_project or "").strip()
+    if requested:
+        project_id = resolve_project(requested, projects)
+        return project_id, project_reference(project_id, projects)
+
+    records = projects if isinstance(projects, list) else []
+    available = [
+        project
+        for project in records
+        if isinstance(project, dict) and isinstance(project.get("id"), str)
+    ]
+    if len(available) == 1:
+        project_id = str(available[0]["id"])
+        return project_id, project_reference(project_id, available)
+    if not available:
+        raise AuthError(
+            "no Feed projects are available for logging; run `feed projects`"
+        )
+
+    choices = ", ".join(
+        sorted(
+            project_reference(str(project["id"]), available) for project in available
+        )
+    )
+    raise AuthError(
+        "Feed project is ambiguous: no default is selected and "
+        f"{len(available)} projects are available ({choices}). "
+        "Run `feed use organization/project` or pass project= explicitly."
+    )
+
+
+def project_reference(project_id: str, projects: Any) -> str:
+    """Return ``organization/slug`` for a project UUID when available."""
+
+    if isinstance(projects, list):
+        for project in projects:
+            if not isinstance(project, dict) or project.get("id") != project_id:
+                continue
+            organization = str(project.get("organization_slug", "")).strip()
+            slug = str(project.get("slug", "")).strip()
+            if organization and slug:
+                return f"{organization}/{slug}"
+            if slug:
+                return slug
+    return project_id
+
+
 def authenticated_project(
-    project: str,
+    project: Optional[str],
     server_url: Optional[str] = None,
     store: Optional[CredentialStore] = None,
-) -> Tuple[str, str, TokenProvider]:
+) -> Tuple[str, str, TokenProvider, str]:
     """Resolve a user-facing project reference to its canonical UUID."""
 
     store = store or CredentialStore()
@@ -209,18 +264,22 @@ def authenticated_project(
     if not resolved_url:
         raise AuthError("Feed credentials contain no ingest server URL")
     provider = TokenProvider(store)
+    projects = credentials.get("projects", [])
+    default_project = credentials.get("default_project")
     try:
-        project_id = resolve_project(project, credentials.get("projects", []))
+        project_id, reference = select_project(project, projects, default_project)
     except AuthError as first_error:
         if "ambiguous" in str(first_error):
             raise
         projects = fetch_projects(credential_control_url(credentials), provider.token())
         store.update(lambda current: current.__setitem__("projects", projects))
         try:
-            project_id = resolve_project(project, projects)
-        except AuthError:
-            raise first_error
-    return resolved_url.rstrip("/"), project_id, provider
+            project_id, reference = select_project(
+                project, projects, default_project
+            )
+        except AuthError as refreshed_error:
+            raise refreshed_error from first_error
+    return resolved_url.rstrip("/"), project_id, provider, reference
 
 
 def resolve_project(reference: str, projects: Any) -> str:

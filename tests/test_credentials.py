@@ -10,8 +10,10 @@ import pytest
 from feed.credentials import (
     CredentialStore,
     TokenProvider,
+    authenticated_project,
     credential_control_url,
     resolve_project,
+    select_project,
 )
 from feed.errors import AuthError
 
@@ -134,3 +136,78 @@ def test_project_reference_supports_canonical_plain_and_uuid():
     )
     with pytest.raises(AuthError, match="ambiguous"):
         resolve_project("shared", projects)
+
+
+def test_project_selection_prefers_saved_default_and_returns_reference():
+    projects = [
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000001",
+            "organization_slug": "lab",
+            "slug": "paper",
+        },
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000002",
+            "organization_slug": "lab",
+            "slug": "other",
+        },
+    ]
+
+    project_id, reference = select_project(None, projects, projects[1]["id"])
+
+    assert project_id == projects[1]["id"]
+    assert reference == "lab/other"
+
+
+def test_project_selection_uses_the_only_available_project_without_default():
+    projects = [
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000001",
+            "organization_slug": "lab",
+            "slug": "paper",
+        }
+    ]
+
+    project_id, reference = select_project(None, projects)
+
+    assert project_id == projects[0]["id"]
+    assert reference == "lab/paper"
+
+
+def test_project_selection_fails_loudly_when_ambiguous():
+    projects = [
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000001",
+            "organization_slug": "lab",
+            "slug": "paper",
+        },
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000002",
+            "organization_slug": "lab",
+            "slug": "other",
+        },
+    ]
+
+    with pytest.raises(AuthError, match="Feed project is ambiguous") as error:
+        select_project(None, projects)
+
+    assert "feed use organization/project" in str(error.value)
+    assert "lab/other" in str(error.value)
+    assert "lab/paper" in str(error.value)
+
+
+def test_authenticated_project_uses_sole_cached_project(tmp_path):
+    store = CredentialStore(tmp_path / "credentials.json")
+    project = {
+        "id": "018f47a8-a82b-7f10-8000-000000000001",
+        "organization_slug": "lab",
+        "slug": "paper",
+    }
+    credentials = _credentials()
+    credentials["projects"] = [project]
+    store.save(credentials)
+
+    url, project_id, _provider, reference = authenticated_project(None, store=store)
+
+    assert url == "https://feed.test/ingest"
+    assert project_id == project["id"]
+    assert reference == "lab/paper"

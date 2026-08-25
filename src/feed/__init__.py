@@ -4,7 +4,7 @@ Quick start::
 
     import feed
 
-    with feed.init(project="my-lab/my-project", name="baseline") as run:
+    with feed.init(name="baseline") as run:
         run.log("train", {"step": 0, "loss": 1.0})
 """
 

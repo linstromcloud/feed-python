@@ -19,10 +19,10 @@ uv run feed login https://feed.example.com/ingest
 uv run feed projects
 ```
 
-Choose an `organization/project` value from that listing and run the example:
+If several projects are listed, select a default once, then run the example:
 
 ```sh
-export FEED_PROJECT=your-organization/your-project
+uv run feed use your-organization/your-project
 uv run python main.py
 ```
 

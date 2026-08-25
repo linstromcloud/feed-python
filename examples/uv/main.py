@@ -2,23 +2,11 @@
 
 from __future__ import annotations
 
-import os
-
 import feed
 
 
-def required_environment(name: str, example: str) -> str:
-    value = os.environ.get(name, "").strip()
-    if not value:
-        raise SystemExit(f"Set {name}, for example: export {name}={example}")
-    return value
-
-
 def main() -> None:
-    project = required_environment("FEED_PROJECT", "your-organization/your-project")
-
     with feed.init(
-        project=project,
         name="uv-smoke-test",
         config={"model": {"width": 64, "blocks": [2, 2]}, "lr": 1e-3},
         tags=["uv", "smoke-test"],

@@ -23,13 +23,19 @@ open the URL on any machine and paste the code into the login-node terminal.
 Your credentials are saved under `~/.config/feed/` and safely shared by jobs
 using the same home directory.
 
-Pick an `organization/project` from `feed projects`, then log a run:
+If you can log to only one project, login selects it automatically. If several
+projects are available, choose a default once:
+
+```sh
+uv run feed use my-lab/my-project
+```
+
+Then log a run without repeating the project:
 
 ```python
 import feed
 
 with feed.init(
-    project="my-lab/my-project",
     name="width-256-seed-7",
     config={"width": 256, "seed": 7, "optimizer": {"lr": 3e-4}},
     tags=["ablation"],
@@ -50,6 +56,11 @@ with feed.init(
 
 The context manager flushes before the process exits. `run.id` is the UUID that
 links every row produced by that run.
+
+Pass `project="organization/project"` or set `FEED_PROJECT` to override the
+saved default for one process. If several projects are available and no default
+has been selected, `feed.init()` raises an error listing the choices instead of
+guessing a destination.
 
 For a complete UV environment and runnable example, see
 [`examples/uv`](examples/uv/README.md).

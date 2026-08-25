@@ -27,7 +27,7 @@ _STANDARD_CHANNELS = (
 
 def init(
     *,
-    project: str,
+    project: Optional[str] = None,
     server_url: Optional[str] = None,
     api_key: Optional[str] = None,
     name: Optional[str] = None,
@@ -40,17 +40,28 @@ def init(
 ) -> "Run":
     """Start a project-scoped Feed run.
 
-    Project is the feed endpoint users share. Credentials default to
-    FEED_API_KEY and the service URL to FEED_URL.
+    Project is the Feed endpoint users share. It defaults to FEED_PROJECT, the
+    project selected by ``feed use``, or the sole project available at login.
+    Credentials default to FEED_API_KEY and the service URL to FEED_URL.
     """
     secret = api_key if api_key is not None else os.environ.get("FEED_API_KEY")
     token_provider = None
-    resolved_project = project
+    requested_project = str(project or os.environ.get("FEED_PROJECT", "")).strip()
+    resolved_project = requested_project
+    project_reference = requested_project
     url = server_url or os.environ.get("FEED_URL") or ""
     if secret is None and enabled:
-        url, resolved_project, token_provider = authenticated_project(project, url)
-    elif enabled and not url:
-        raise ValueError("server_url is required (or set FEED_URL)")
+        url, resolved_project, token_provider, project_reference = (
+            authenticated_project(requested_project or None, url)
+        )
+    elif enabled:
+        if not requested_project:
+            raise ValueError(
+                "project is required with API-key authentication "
+                "(pass project= or set FEED_PROJECT)"
+            )
+        if not url:
+            raise ValueError("server_url is required (or set FEED_URL)")
     client_config = Config(
         server_url=url,
         endpoint_id=resolved_project,
@@ -64,7 +75,7 @@ def init(
     if max_retry_queue_depth is not None:
         client_config.max_retry_queue_depth = max_retry_queue_depth
     client = Client(client_config)
-    run = Run(_client=client, project=project)
+    run = Run(_client=client, project=project_reference)
     if enabled:
         run._emit_run_metadata(
             name=name, config=config or {}, tags=list(tags or ()), group=group
