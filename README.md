@@ -74,8 +74,8 @@ uv run feed enable my-lab/my-project
 ```
 
 Attach that source to any query workspace that should read the project. Other
-project members only need `feed login`; their existing project permissions
-control both logging and querying.
+project members only need `feed login` (and `feed use` when they can access
+several projects); their existing permissions control logging and querying.
 
 ## The run API
 
