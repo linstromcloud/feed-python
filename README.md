@@ -57,10 +57,11 @@ with feed.init(
 The context manager flushes before the process exits. `run.id` is the UUID that
 links every row produced by that run.
 
-Pass `project="organization/project"` or set `FEED_PROJECT` to override the
-saved default for one process. If several projects are available and no default
-has been selected, `feed.init()` raises an error listing the choices instead of
-guessing a destination.
+Pass `project="Project Name"` (or its UUID) or set `FEED_PROJECT` to override
+the saved default for one process. A project name must be unique among the
+projects available to the signed-in user. If several projects are available and
+no default has been selected, `feed.init()` raises an error listing the choices
+instead of guessing a destination.
 
 For a complete UV environment and runnable example, see
 [`examples/uv`](examples/uv/README.md).
@@ -70,7 +71,7 @@ For a complete UV environment and runnable example, see
 A project owner enables its queryable Feed source once:
 
 ```sh
-uv run feed enable my-lab/my-project
+uv run feed enable "Project Name"
 ```
 
 Attach that source to any query workspace that should read the project. Other

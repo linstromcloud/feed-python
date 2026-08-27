@@ -50,12 +50,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     use = subcommands.add_parser(
         "use", help="select the default project for logging"
     )
-    use.add_argument("project", help="project UUID, slug, or organization/slug")
+    use.add_argument("project", help="unique project name or UUID")
 
     enable = subcommands.add_parser(
         "enable", help="enable the managed project catalog for querying"
     )
-    enable.add_argument("project", help="project UUID, slug, or organization/slug")
+    enable.add_argument("project", help="unique project name or UUID")
 
     args = parser.parse_args(argv)
     try:
@@ -225,10 +225,10 @@ def _print_projects(records: Any, default_project: Optional[str] = None) -> None
         print("No projects with logging permission.")
         return
     for project in records:
-        reference = f"{project['organization_slug']}/{project['slug']}"
-        label = project.get("name") or project["slug"]
+        reference = project_reference(str(project["id"]), records)
+        organization = project.get("organization_slug") or "-"
         selected = "\tdefault" if project.get("id") == default_project else ""
-        print(f"{reference}\t{label}\t{project['role']}{selected}")
+        print(f"{reference}\t{organization}\t{project['role']}{selected}")
 
 
 def _select_provider(control_url: str) -> str:

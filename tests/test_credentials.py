@@ -12,6 +12,7 @@ from feed.credentials import (
     TokenProvider,
     authenticated_project,
     credential_control_url,
+    fetch_projects,
     resolve_project,
     select_project,
 )
@@ -111,6 +112,80 @@ def test_control_url_defaults_to_ingest_origin():
     )
 
 
+def test_fetch_projects_uses_slugless_me_listing(monkeypatch):
+    project_id = "018f47a8-a82b-7f10-8000-000000000001"
+    calls = []
+
+    def get(url, *, headers, timeout):
+        calls.append((url, headers, timeout))
+        assert url == "https://control.test/v1/me/projects"
+        return _Response(
+            {
+                "items": [
+                    {
+                        "project_id": project_id,
+                        "name": "GAP",
+                        "owning_organization": {
+                            "id": "018f47a8-a82b-7f10-8000-000000000010",
+                            "slug": "gapindnns",
+                            "display_name": "GAP",
+                        },
+                        "role": "owner",
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("feed.credentials.requests.get", get)
+
+    assert fetch_projects("https://control.test", "access-1") == [
+        {
+            "id": project_id,
+            "name": "GAP",
+            "organization_slug": "gapindnns",
+            "role": "owner",
+        }
+    ]
+    assert len(calls) == 1
+
+
+def test_slugless_project_resolves_by_unique_name():
+    projects = [
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000001",
+            "name": "GAP",
+            "organization_slug": "gapindnns",
+        }
+    ]
+
+    project_id, reference = select_project("gap", projects)
+
+    assert project_id == projects[0]["id"]
+    assert reference == "GAP"
+
+
+def test_duplicate_project_names_require_uuid():
+    projects = [
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000001",
+            "name": "GAP",
+            "organization_slug": "lab-a",
+        },
+        {
+            "id": "018f47a8-a82b-7f10-8000-000000000002",
+            "name": "GAP",
+            "organization_slug": "lab-b",
+        },
+    ]
+
+    with pytest.raises(AuthError, match="ambiguous") as error:
+        resolve_project("GAP", projects)
+
+    assert projects[0]["id"] in str(error.value)
+    assert projects[1]["id"] in str(error.value)
+    assert select_project(None, projects, projects[0]["id"])[1] == projects[0]["id"]
+
+
 def test_project_reference_supports_canonical_plain_and_uuid():
     projects = [
         {
@@ -190,7 +265,7 @@ def test_project_selection_fails_loudly_when_ambiguous():
     with pytest.raises(AuthError, match="Feed project is ambiguous") as error:
         select_project(None, projects)
 
-    assert "feed use organization/project" in str(error.value)
+    assert "feed use PROJECT_NAME_OR_ID" in str(error.value)
     assert "lab/other" in str(error.value)
     assert "lab/paper" in str(error.value)
 

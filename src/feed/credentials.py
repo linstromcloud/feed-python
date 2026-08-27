@@ -231,17 +231,29 @@ def select_project(
     raise AuthError(
         "Feed project is ambiguous: no default is selected and "
         f"{len(available)} projects are available ({choices}). "
-        "Run `feed use organization/project` or pass project= explicitly."
+        "Run `feed use PROJECT_NAME_OR_ID` or pass project= explicitly."
     )
 
 
 def project_reference(project_id: str, projects: Any) -> str:
-    """Return ``organization/slug`` for a project UUID when available."""
+    """Return a unique project name, legacy slug reference, or UUID."""
 
     if isinstance(projects, list):
         for project in projects:
             if not isinstance(project, dict) or project.get("id") != project_id:
                 continue
+            name = str(project.get("name", "")).strip()
+            same_name = [
+                item
+                for item in projects
+                if isinstance(item, dict)
+                and str(item.get("name", "")).strip().casefold()
+                == name.casefold()
+            ]
+            if name and len(same_name) == 1:
+                return name
+            # Credentials written by Feed versions predating the slugless
+            # Duckvis project contract remain usable until the next refresh.
             organization = str(project.get("organization_slug", "")).strip()
             slug = str(project.get("slug", "")).strip()
             if organization and slug:
@@ -291,6 +303,20 @@ def resolve_project(reference: str, projects: Any) -> str:
     if not isinstance(projects, list):
         projects = []
     normalized = reference.lower().strip("/")
+    by_name = [
+        project
+        for project in projects
+        if str(project.get("name", "")).strip().casefold() == normalized.casefold()
+    ]
+    if len(by_name) == 1:
+        return str(by_name[0]["id"])
+    if len(by_name) > 1:
+        choices = ", ".join(sorted(str(item["id"]) for item in by_name))
+        raise AuthError(
+            f"project name {reference!r} is ambiguous; use one of these UUIDs: {choices}"
+        )
+
+    # Legacy cached credentials may still carry the retired project slug.
     canonical = [
         project
         for project in projects
@@ -330,21 +356,23 @@ def fetch_projects(control_url: str, access_token: str) -> List[Dict[str, Any]]:
         project_id = item.get("project_id")
         if not isinstance(project_id, str):
             continue
-        detail_response = requests.get(
-            f"{base}/v1/projects/{project_id}", headers=headers, timeout=15
-        )
-        detail = _json_response(detail_response, f"read project {project_id}")
-        organization = detail.get("owning_organization") or {}
+        organization = item.get("owning_organization") or {}
         projects.append(
             {
                 "id": project_id,
-                "slug": detail.get("slug", ""),
-                "name": detail.get("name", ""),
+                "name": item.get("name", ""),
                 "organization_slug": organization.get("slug", ""),
                 "role": item.get("role"),
             }
         )
-    return sorted(projects, key=lambda p: (p["organization_slug"], p["slug"]))
+    return sorted(
+        projects,
+        key=lambda project: (
+            str(project["organization_slug"]).casefold(),
+            str(project["name"]).casefold(),
+            project["id"],
+        ),
+    )
 
 
 def _json_response(response: requests.Response, action: str) -> Dict[str, Any]:

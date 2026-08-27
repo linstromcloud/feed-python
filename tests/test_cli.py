@@ -49,7 +49,6 @@ def test_login_selects_the_only_project_by_default(tmp_path, monkeypatch, capsys
     project = {
         "id": "018f47a8-a82b-7f10-8000-000000000001",
         "organization_slug": "lab",
-        "slug": "paper",
         "name": "Paper",
         "role": "owner",
     }
@@ -74,8 +73,8 @@ def test_login_selects_the_only_project_by_default(tmp_path, monkeypatch, capsys
 
     assert store.load()["default_project"] == project["id"]
     output = capsys.readouterr().out
-    assert "lab/paper\tPaper\towner\tdefault" in output
-    assert "Using the only available project by default: lab/paper" in output
+    assert "Paper\tlab\towner\tdefault" in output
+    assert "Using the only available project by default: Paper" in output
 
 
 def test_use_selects_a_cached_project(tmp_path, monkeypatch, capsys):
