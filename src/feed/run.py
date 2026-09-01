@@ -8,7 +8,7 @@ from typing import Any, Iterable, Mapping, Optional, Union, overload
 
 from .client import Client
 from .config import ChannelSettings, Config
-from .credentials import authenticated_project
+from .credentials import authenticated_feed
 from .delivery import DeliveryReport
 from .fields import EventBuilder
 
@@ -26,8 +26,8 @@ _STANDARD_CHANNELS = (
 
 
 def init(
+    feed: Optional[str] = None,
     *,
-    project: Optional[str] = None,
     server_url: Optional[str] = None,
     api_key: Optional[str] = None,
     name: Optional[str] = None,
@@ -38,33 +38,34 @@ def init(
     max_retries: Optional[int] = None,
     max_retry_queue_depth: Optional[int] = None,
 ) -> "Run":
-    """Start a project-scoped Feed run.
+    """Start a run in a shared feed.
 
-    Project is the Feed endpoint users share. It defaults to FEED_PROJECT, the
-    project selected by ``feed use``, or the sole project available at login.
-    Credentials default to FEED_API_KEY and the service URL to FEED_URL.
+    ``feed`` is the ``project/feed`` reference printed by ``feed list``. It
+    defaults to FEED, the feed selected by ``feed use``, or the sole feed
+    available at login. Credentials default to FEED_API_KEY and the service
+    URL to FEED_URL.
     """
     secret = api_key if api_key is not None else os.environ.get("FEED_API_KEY")
     token_provider = None
-    requested_project = str(project or os.environ.get("FEED_PROJECT", "")).strip()
-    resolved_project = requested_project
-    project_reference = requested_project
+    requested_feed = str(feed or os.environ.get("FEED", "")).strip()
+    resolved_feed = requested_feed
+    feed_reference = requested_feed
     url = server_url or os.environ.get("FEED_URL") or ""
     if secret is None and enabled:
-        url, resolved_project, token_provider, project_reference = (
-            authenticated_project(requested_project or None, url)
+        url, resolved_feed, token_provider, feed_reference = authenticated_feed(
+            requested_feed or None, url
         )
     elif enabled:
-        if not requested_project:
+        if not requested_feed:
             raise ValueError(
-                "project is required with API-key authentication "
-                "(pass project= or set FEED_PROJECT)"
+                "feed is required with API-key authentication (pass feed or set FEED)"
             )
         if not url:
             raise ValueError("server_url is required (or set FEED_URL)")
+        resolved_feed = requested_feed.rsplit("/", 1)[-1]
     client_config = Config(
         server_url=url,
-        endpoint_id=resolved_project,
+        endpoint_id=resolved_feed,
         client_secret=secret,
         bearer_token_provider=token_provider,
         channels=list(_STANDARD_CHANNELS),
@@ -75,7 +76,7 @@ def init(
     if max_retry_queue_depth is not None:
         client_config.max_retry_queue_depth = max_retry_queue_depth
     client = Client(client_config)
-    run = Run(_client=client, project=project_reference)
+    run = Run(_client=client, feed=feed_reference)
     if enabled:
         run._emit_run_metadata(
             name=name, config=config or {}, tags=list(tags or ()), group=group
@@ -88,7 +89,7 @@ class Run:
     """One recorded session. Record fields have no implicit semantics."""
 
     _client: Client = field(repr=False)
-    project: str
+    feed: str
 
     @property
     def id(self) -> str:

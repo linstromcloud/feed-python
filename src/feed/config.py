@@ -56,14 +56,14 @@ class ChannelSettings:
 class Config:
     """Internal transport configuration assembled by :func:`feed.init`."""
 
-    #: Feed ingest root URL, e.g. ``https://feed.example.com/ingest``.
+    #: Feed ingest origin discovered from the selected feed.
     server_url: str
-    #: Endpoint identifier used as the project-scoped request path segment.
+    #: Feed slug used as the request path segment.
     endpoint_id: str
     #: Optional shared secret sent as the ``X-Client-Secret`` header.
     client_secret: Optional[str] = None
     #: Optional callable returning a current user bearer token. Used by the
-    #: project-scoped login flow; mutually exclusive with ``client_secret``.
+    #: member login flow; mutually exclusive with ``client_secret``.
     bearer_token_provider: Optional[Callable[[], str]] = None
     #: Channel definitions. The default channel is added automatically if absent.
     channels: List[ChannelSettings] = field(default_factory=list)

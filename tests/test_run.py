@@ -9,9 +9,9 @@ def test_disabled_run_needs_no_credentials_or_endpoint(monkeypatch):
     def fail_authentication(*_args, **_kwargs):
         raise AssertionError("disabled runs must not authenticate")
 
-    monkeypatch.setattr(run_module, "authenticated_project", fail_authentication)
+    monkeypatch.setattr(run_module, "authenticated_feed", fail_authentication)
 
-    run = init(project="lab/project", enabled=False)
+    run = init("Research/feed-a", enabled=False)
 
     assert not run.log("train", {"unsupported": object(), "missing": None})
     assert not run.log_wait("train", {"values": []}, timeout=0)
@@ -20,22 +20,22 @@ def test_disabled_run_needs_no_credentials_or_endpoint(monkeypatch):
 
 
 def test_disabled_run_still_has_an_identity():
-    run = init(project="lab/project", enabled=False)
-    assert run.project == "lab/project"
+    run = init("Research/feed-a", enabled=False)
+    assert run.feed == "Research/feed-a"
     assert run.id
 
 
-def test_init_without_project_uses_authenticated_default(monkeypatch):
+def test_init_without_feed_uses_authenticated_default(monkeypatch):
     captured = {}
 
-    def authenticate(project, server_url):
-        captured["project"] = project
+    def authenticate(feed, server_url):
+        captured["feed"] = feed
         captured["server_url"] = server_url
         return (
-            "https://feed.test/ingest",
-            "018f47a8-a82b-7f10-8000-000000000001",
+            "https://paper.feed.test",
+            "paper",
             lambda: "access-token",
-            "lab/paper",
+            "Research/paper",
         )
 
     class _Client:
@@ -45,8 +45,8 @@ def test_init_without_project_uses_authenticated_default(monkeypatch):
         def __init__(self, config):
             captured["config"] = config
 
-    monkeypatch.delenv("FEED_PROJECT", raising=False)
-    monkeypatch.setattr(run_module, "authenticated_project", authenticate)
+    monkeypatch.delenv("FEED", raising=False)
+    monkeypatch.setattr(run_module, "authenticated_feed", authenticate)
     monkeypatch.setattr(run_module, "Client", _Client)
     monkeypatch.setattr(
         run_module.Run, "_emit_run_metadata", lambda *args, **kwargs: True
@@ -54,6 +54,6 @@ def test_init_without_project_uses_authenticated_default(monkeypatch):
 
     run = init()
 
-    assert captured["project"] is None
-    assert captured["config"].endpoint_id.endswith("0001")
-    assert run.project == "lab/paper"
+    assert captured["feed"] is None
+    assert captured["config"].endpoint_id == "paper"
+    assert run.feed == "Research/paper"

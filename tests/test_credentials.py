@@ -5,18 +5,15 @@ import stat
 import threading
 import time
 
-import pytest
-
 from feed.credentials import (
     CredentialStore,
     TokenProvider,
-    authenticated_project,
+    authenticated_feed,
     credential_control_url,
+    feed_reference,
+    fetch_feeds,
     fetch_projects,
-    resolve_project,
-    select_project,
 )
-from feed.errors import AuthError
 
 
 def _jwt(exp):
@@ -149,140 +146,57 @@ def test_fetch_projects_uses_slugless_me_listing(monkeypatch):
     assert len(calls) == 1
 
 
-def test_slugless_project_resolves_by_unique_name():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "name": "GAP",
-            "organization_slug": "gapindnns",
-        }
-    ]
-
-    project_id, reference = select_project("gap", projects)
-
-    assert project_id == projects[0]["id"]
-    assert reference == "GAP"
-
-
-def test_duplicate_project_names_require_uuid():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "name": "GAP",
-            "organization_slug": "lab-a",
-        },
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000002",
-            "name": "GAP",
-            "organization_slug": "lab-b",
-        },
-    ]
-
-    with pytest.raises(AuthError, match="ambiguous") as error:
-        resolve_project("GAP", projects)
-
-    assert projects[0]["id"] in str(error.value)
-    assert projects[1]["id"] in str(error.value)
-    assert select_project(None, projects, projects[0]["id"])[1] == projects[0]["id"]
-
-
-def test_project_reference_supports_canonical_plain_and_uuid():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "organization_slug": "lab-a",
-            "slug": "paper",
-        },
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000002",
-            "organization_slug": "lab-b",
-            "slug": "shared",
-        },
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000003",
-            "organization_slug": "lab-c",
-            "slug": "shared",
-        },
-    ]
-    assert resolve_project("paper", projects).endswith("0001")
-    assert resolve_project("lab-b/shared", projects).endswith("0002")
-    assert resolve_project("018f47a8-a82b-7f10-8000-000000000003", projects).endswith(
-        "0003"
-    )
-    with pytest.raises(AuthError, match="ambiguous"):
-        resolve_project("shared", projects)
-
-
-def test_project_selection_prefers_saved_default_and_returns_reference():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "organization_slug": "lab",
-            "slug": "paper",
-        },
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000002",
-            "organization_slug": "lab",
-            "slug": "other",
-        },
-    ]
-
-    project_id, reference = select_project(None, projects, projects[1]["id"])
-
-    assert project_id == projects[1]["id"]
-    assert reference == "lab/other"
-
-
-def test_project_selection_uses_the_only_available_project_without_default():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "organization_slug": "lab",
-            "slug": "paper",
-        }
-    ]
-
-    project_id, reference = select_project(None, projects)
-
-    assert project_id == projects[0]["id"]
-    assert reference == "lab/paper"
-
-
-def test_project_selection_fails_loudly_when_ambiguous():
-    projects = [
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000001",
-            "organization_slug": "lab",
-            "slug": "paper",
-        },
-        {
-            "id": "018f47a8-a82b-7f10-8000-000000000002",
-            "organization_slug": "lab",
-            "slug": "other",
-        },
-    ]
-
-    with pytest.raises(AuthError, match="Feed project is ambiguous") as error:
-        select_project(None, projects)
-
-    assert "feed use PROJECT_NAME_OR_ID" in str(error.value)
-    assert "lab/other" in str(error.value)
-    assert "lab/paper" in str(error.value)
-
-
-def test_authenticated_project_uses_sole_cached_project(tmp_path):
-    store = CredentialStore(tmp_path / "credentials.json")
+def test_fetch_feeds_builds_copyable_project_feed_references(monkeypatch):
     project = {
         "id": "018f47a8-a82b-7f10-8000-000000000001",
         "organization_slug": "lab",
+        "name": "Research",
+        "role": "owner",
+    }
+
+    def get(url, *, headers, timeout):
+        assert url.endswith(f"/v1/projects/{project['id']}/feeds")
+        return _Response(
+            {
+                "items": [
+                    {
+                        "id": "018f47a8-a82b-7f10-8000-000000000101",
+                        "name": "Main feed",
+                        "slug": "paper",
+                        "kind": "inhouse",
+                        "lifecycle": "active",
+                        "status": {
+                            "phase": "ready",
+                            "ingest_url": "https://paper.feed.test/v1/paper",
+                        },
+                    }
+                ]
+            }
+        )
+
+    monkeypatch.setattr("feed.credentials.requests.get", get)
+    feeds = fetch_feeds("https://control.test", "access-1", [project])
+
+    assert feed_reference(feeds[0], feeds) == "Research/paper"
+    assert feeds[0]["ingest_url"] == "https://paper.feed.test/v1/paper"
+
+
+def test_authenticated_feed_uses_sole_cached_feed(tmp_path):
+    store = CredentialStore(tmp_path / "credentials.json")
+    feed = {
+        "id": "018f47a8-a82b-7f10-8000-000000000101",
+        "project_reference": "Research",
         "slug": "paper",
+        "lifecycle": "active",
+        "phase": "ready",
+        "ingest_url": "https://paper.feed.test/v1/paper",
     }
     credentials = _credentials()
-    credentials["projects"] = [project]
+    credentials["feeds"] = [feed]
     store.save(credentials)
 
-    url, project_id, _provider, reference = authenticated_project(None, store=store)
+    url, slug, _provider, reference = authenticated_feed(None, store=store)
 
-    assert url == "https://feed.test/ingest"
-    assert project_id == project["id"]
-    assert reference == "lab/paper"
+    assert url == "https://paper.feed.test"
+    assert slug == "paper"
+    assert reference == "Research/paper"

@@ -36,7 +36,8 @@ _CREDENTIAL_KEYS = {
     "device_guid",
     "refresh_token",
     "projects",
-    "default_project",
+    "feeds",
+    "default_feed",
 }
 
 
@@ -96,7 +97,7 @@ class CredentialStore:
                 credentials = json.load(handle)
         except FileNotFoundError as exc:
             raise AuthError(
-                "not logged in; run `feed login https://.../ingest` first"
+                "not logged in; run `feed login https://...` first"
             ) from exc
         except (OSError, ValueError) as exc:
             raise AuthError(f"cannot read Feed credentials: {exc}") from exc
@@ -197,44 +198,6 @@ def credential_control_url(credentials: Dict[str, Any]) -> str:
     raise AuthError("Feed credentials contain no control API URL")
 
 
-def select_project(
-    reference: Optional[str],
-    projects: Any,
-    default_project: Optional[str] = None,
-) -> Tuple[str, str]:
-    """Select a project and return its UUID and user-facing reference."""
-
-    requested = str(reference or "").strip() or str(default_project or "").strip()
-    if requested:
-        project_id = resolve_project(requested, projects)
-        return project_id, project_reference(project_id, projects)
-
-    records = projects if isinstance(projects, list) else []
-    available = [
-        project
-        for project in records
-        if isinstance(project, dict) and isinstance(project.get("id"), str)
-    ]
-    if len(available) == 1:
-        project_id = str(available[0]["id"])
-        return project_id, project_reference(project_id, available)
-    if not available:
-        raise AuthError(
-            "no Feed projects are available for logging; run `feed projects`"
-        )
-
-    choices = ", ".join(
-        sorted(
-            project_reference(str(project["id"]), available) for project in available
-        )
-    )
-    raise AuthError(
-        "Feed project is ambiguous: no default is selected and "
-        f"{len(available)} projects are available ({choices}). "
-        "Run `feed use PROJECT_NAME_OR_ID` or pass project= explicitly."
-    )
-
-
 def project_reference(project_id: str, projects: Any) -> str:
     """Return a unique project name, legacy slug reference, or UUID."""
 
@@ -247,13 +210,12 @@ def project_reference(project_id: str, projects: Any) -> str:
                 item
                 for item in projects
                 if isinstance(item, dict)
-                and str(item.get("name", "")).strip().casefold()
-                == name.casefold()
+                and str(item.get("name", "")).strip().casefold() == name.casefold()
             ]
             if name and len(same_name) == 1:
                 return name
-            # Credentials written by Feed versions predating the slugless
-            # Duckvis project contract remain usable until the next refresh.
+            # Credentials written before project names became canonical remain
+            # usable until the next refresh.
             organization = str(project.get("organization_slug", "")).strip()
             slug = str(project.get("slug", "")).strip()
             if organization and slug:
@@ -263,83 +225,112 @@ def project_reference(project_id: str, projects: Any) -> str:
     return project_id
 
 
-def authenticated_project(
-    project: Optional[str],
+def authenticated_feed(
+    feed: Optional[str],
     server_url: Optional[str] = None,
     store: Optional[CredentialStore] = None,
 ) -> Tuple[str, str, TokenProvider, str]:
-    """Resolve a user-facing project reference to its canonical UUID."""
+    """Resolve a ``project/feed`` reference to its active ingest URL."""
 
     store = store or CredentialStore()
     credentials = store.load()
-    resolved_url = server_url or str(credentials.get("server_url", ""))
-    if not resolved_url:
-        raise AuthError("Feed credentials contain no ingest server URL")
     provider = TokenProvider(store)
-    projects = credentials.get("projects", [])
-    default_project = credentials.get("default_project")
+    feeds = credentials.get("feeds", [])
+    default_feed = credentials.get("default_feed")
     try:
-        project_id, reference = select_project(project, projects, default_project)
+        selected, reference = select_feed(feed, feeds, default_feed)
     except AuthError as first_error:
         if "ambiguous" in str(first_error):
             raise
-        projects = fetch_projects(credential_control_url(credentials), provider.token())
-        store.update(lambda current: current.__setitem__("projects", projects))
+        control_url = credential_control_url(credentials)
+        projects = fetch_projects(control_url, provider.token())
+        feeds = fetch_feeds(control_url, provider.token(), projects)
+
+        def refresh(current: Dict[str, Any]) -> None:
+            current["projects"] = projects
+            current["feeds"] = feeds
+
+        store.update(refresh)
         try:
-            project_id, reference = select_project(
-                project, projects, default_project
-            )
+            selected, reference = select_feed(feed, feeds, default_feed)
         except AuthError as refreshed_error:
             raise refreshed_error from first_error
-    return resolved_url.rstrip("/"), project_id, provider, reference
-
-
-def resolve_project(reference: str, projects: Any) -> str:
-    reference = reference.strip()
-    try:
-        return str(uuid.UUID(reference))
-    except ValueError:
-        pass
-    if not isinstance(projects, list):
-        projects = []
-    normalized = reference.lower().strip("/")
-    by_name = [
-        project
-        for project in projects
-        if str(project.get("name", "")).strip().casefold() == normalized.casefold()
-    ]
-    if len(by_name) == 1:
-        return str(by_name[0]["id"])
-    if len(by_name) > 1:
-        choices = ", ".join(sorted(str(item["id"]) for item in by_name))
+    slug = str(selected["slug"])
+    ingest_url = str(selected.get("ingest_url", "")).rstrip("/")
+    if selected.get("lifecycle") != "active" or not ingest_url:
         raise AuthError(
-            f"project name {reference!r} is ambiguous; use one of these UUIDs: {choices}"
+            f"feed {reference!r} is not ready for logging; run `feed list` for status"
         )
+    suffix = f"/v1/{slug}"
+    if not ingest_url.endswith(suffix):
+        raise AuthError(f"feed {reference!r} returned an invalid ingest URL")
+    discovered_url = ingest_url[: -len(suffix)]
+    return (server_url or discovered_url).rstrip("/"), slug, provider, reference
 
-    # Legacy cached credentials may still carry the retired project slug.
-    canonical = [
-        project
-        for project in projects
-        if f"{project.get('organization_slug', '')}/{project.get('slug', '')}".lower()
-        == normalized
+
+def select_feed(
+    reference: Optional[str],
+    feeds: Any,
+    default_feed: Optional[str] = None,
+) -> Tuple[Dict[str, Any], str]:
+    """Select a feed and return its cached record and canonical reference."""
+
+    requested = str(reference or "").strip() or str(default_feed or "").strip()
+    records = (
+        [item for item in feeds if isinstance(item, dict)]
+        if isinstance(feeds, list)
+        else []
+    )
+    if requested:
+        selected = resolve_feed(requested, records)
+        return selected, feed_reference(selected, records)
+    if len(records) == 1:
+        return records[0], feed_reference(records[0], records)
+    if not records:
+        raise AuthError("no feeds are available for logging; run `feed list`")
+    choices = ", ".join(sorted(feed_reference(item, records) for item in records))
+    raise AuthError(
+        f"feed is ambiguous: no default is selected and {len(records)} feeds are available "
+        f"({choices}). Run `feed use PROJECT/FEED` or pass the feed to feed.init()."
+    )
+
+
+def resolve_feed(reference: str, feeds: Any) -> Dict[str, Any]:
+    records = (
+        [item for item in feeds if isinstance(item, dict)]
+        if isinstance(feeds, list)
+        else []
+    )
+    normalized = reference.strip().strip("/").casefold()
+    matches = [
+        item
+        for item in records
+        if normalized
+        in {
+            str(item.get("id", "")).casefold(),
+            feed_reference(item, records).casefold(),
+        }
     ]
-    if len(canonical) == 1:
-        return str(canonical[0]["id"])
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        choices = ", ".join(sorted(feed_reference(item, records) for item in matches))
+        raise AuthError(f"feed {reference!r} is ambiguous; use one of: {choices}")
+
     by_slug = [
-        project
-        for project in projects
-        if str(project.get("slug", "")).lower() == normalized
+        item for item in records if str(item.get("slug", "")).casefold() == normalized
     ]
     if len(by_slug) == 1:
-        return str(by_slug[0]["id"])
-    if len(by_slug) > 1:
-        choices = ", ".join(
-            sorted(f"{item['organization_slug']}/{item['slug']}" for item in by_slug)
-        )
-        raise AuthError(f"project {reference!r} is ambiguous; use one of: {choices}")
-    raise AuthError(
-        f"project {reference!r} is not available for logging; run `feed projects`"
-    )
+        return by_slug[0]
+    raise AuthError(f"feed {reference!r} is not available; run `feed list`")
+
+
+def feed_reference(feed: Dict[str, Any], feeds: Any = None) -> str:
+    project = str(feed.get("project_reference", "")).strip()
+    slug = str(feed.get("slug", "")).strip()
+    if project and slug:
+        return f"{project}/{slug}"
+    return str(feed.get("id", slug))
 
 
 def fetch_projects(control_url: str, access_token: str) -> List[Dict[str, Any]]:
@@ -373,6 +364,51 @@ def fetch_projects(control_url: str, access_token: str) -> List[Dict[str, Any]]:
             project["id"],
         ),
     )
+
+
+def fetch_feeds(
+    control_url: str,
+    access_token: str,
+    projects: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Return declared feeds across every project available for logging."""
+
+    base = control_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {access_token}"}
+    feeds: List[Dict[str, Any]] = []
+    for project in projects:
+        project_id = str(project["id"])
+        response = requests.get(
+            f"{base}/v1/projects/{project_id}/feeds",
+            headers=headers,
+            timeout=15,
+        )
+        listing = _json_response(
+            response, f"list feeds in {project_reference(project_id, projects)}"
+        )
+        for item in listing.get("items", []):
+            if not isinstance(item, dict):
+                continue
+            endpoint_id = item.get("id")
+            slug = item.get("slug")
+            if not isinstance(endpoint_id, str) or not isinstance(slug, str):
+                continue
+            status = item.get("status") if isinstance(item.get("status"), dict) else {}
+            feeds.append(
+                {
+                    "id": endpoint_id,
+                    "slug": slug,
+                    "name": item.get("name", ""),
+                    "kind": item.get("kind", "gcp"),
+                    "lifecycle": item.get("lifecycle", "unknown"),
+                    "phase": status.get("phase", "pending"),
+                    "ingest_url": status.get("ingest_url"),
+                    "project_id": project_id,
+                    "project_reference": project_reference(project_id, projects),
+                    "role": project.get("role"),
+                }
+            )
+    return sorted(feeds, key=lambda item: feed_reference(item).casefold())
 
 
 def _json_response(response: requests.Response, action: str) -> Dict[str, Any]:

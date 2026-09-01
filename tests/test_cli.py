@@ -44,7 +44,7 @@ def test_login_accepts_positional_deployment_url(monkeypatch):
     }
 
 
-def test_login_selects_the_only_project_by_default(tmp_path, monkeypatch, capsys):
+def test_login_selects_the_only_feed_by_default(tmp_path, monkeypatch, capsys):
     store = CredentialStore(tmp_path / "credentials.json")
     project = {
         "id": "018f47a8-a82b-7f10-8000-000000000001",
@@ -55,6 +55,21 @@ def test_login_selects_the_only_project_by_default(tmp_path, monkeypatch, capsys
     monkeypatch.setattr(cli, "CredentialStore", lambda: store)
     monkeypatch.setattr(cli.requests, "post", lambda *args, **kwargs: _AuthResponse())
     monkeypatch.setattr(cli, "fetch_projects", lambda *_args: [project])
+    monkeypatch.setattr(
+        cli,
+        "fetch_feeds",
+        lambda *_args: [
+            {
+                "id": "018f47a8-a82b-7f10-8000-000000000101",
+                "project_reference": "Paper",
+                "slug": "training",
+                "phase": "ready",
+                "role": "owner",
+                "lifecycle": "active",
+                "ingest_url": "https://training.feed.test/v1/training",
+            }
+        ],
+    )
     monkeypatch.setattr(builtins, "input", lambda _prompt: "one-time-code")
 
     assert (
@@ -71,44 +86,46 @@ def test_login_selects_the_only_project_by_default(tmp_path, monkeypatch, capsys
         == 0
     )
 
-    assert store.load()["default_project"] == project["id"]
+    assert store.load()["default_feed"].endswith("0101")
     output = capsys.readouterr().out
-    assert "Paper\tlab\towner\tdefault" in output
-    assert "Using the only available project by default: Paper" in output
+    assert "Paper/training\tready\towner\tdefault" in output
+    assert "Using the only available feed by default: Paper/training" in output
 
 
-def test_use_selects_a_cached_project(tmp_path, monkeypatch, capsys):
+def test_use_selects_a_cached_feed(tmp_path, monkeypatch, capsys):
     store = CredentialStore(tmp_path / "credentials.json")
     store.save(
         {
             "version": 1,
             "server_url": "https://feed.test/ingest",
             "refresh_token": "refresh-1",
-            "projects": [
+            "feeds": [
                 {
-                    "id": "018f47a8-a82b-7f10-8000-000000000001",
-                    "organization_slug": "lab",
-                    "slug": "paper",
+                    "id": "018f47a8-a82b-7f10-8000-000000000101",
+                    "project_reference": "Paper",
+                    "slug": "training",
                     "role": "owner",
+                    "phase": "ready",
                 },
                 {
-                    "id": "018f47a8-a82b-7f10-8000-000000000002",
-                    "organization_slug": "lab",
-                    "slug": "other",
+                    "id": "018f47a8-a82b-7f10-8000-000000000102",
+                    "project_reference": "Paper",
+                    "slug": "evaluation",
                     "role": "editor",
+                    "phase": "ready",
                 },
             ],
         }
     )
     monkeypatch.setattr(cli, "CredentialStore", lambda: store)
 
-    assert cli.main(["use", "lab/paper"]) == 0
+    assert cli.main(["use", "Paper/training"]) == 0
 
-    assert store.load()["default_project"].endswith("0001")
-    assert "Default Feed project: lab/paper" in capsys.readouterr().out
+    assert store.load()["default_feed"].endswith("0101")
+    assert "Default feed: Paper/training" in capsys.readouterr().out
 
 
-def test_enable_resolves_project_and_uses_control_token(tmp_path, monkeypatch, capsys):
+def test_list_refreshes_project_and_feed_catalog(tmp_path, monkeypatch, capsys):
     store = CredentialStore(tmp_path / "credentials.json")
     store.save(
         {
@@ -116,14 +133,8 @@ def test_enable_resolves_project_and_uses_control_token(tmp_path, monkeypatch, c
             "control_url": "https://control.test",
             "server_url": "https://feed.test/ingest",
             "refresh_token": "refresh-1",
-            "projects": [
-                {
-                    "id": "018f47a8-a82b-7f10-8000-000000000001",
-                    "organization_slug": "lab",
-                    "slug": "paper",
-                    "role": "owner",
-                }
-            ],
+            "projects": [],
+            "feeds": [],
         }
     )
     monkeypatch.setattr(cli, "CredentialStore", lambda: store)
@@ -136,18 +147,21 @@ def test_enable_resolves_project_and_uses_control_token(tmp_path, monkeypatch, c
             return "control-access"
 
     monkeypatch.setattr(cli, "TokenProvider", _Tokens)
-    calls = []
+    project = {
+        "id": "018f47a8-a82b-7f10-8000-000000000001",
+        "name": "Paper",
+        "role": "owner",
+    }
+    feed = {
+        "id": "018f47a8-a82b-7f10-8000-000000000101",
+        "project_reference": "Paper",
+        "slug": "training",
+        "phase": "provisioning",
+        "role": "owner",
+    }
+    monkeypatch.setattr(cli, "fetch_projects", lambda *_args: [project])
+    monkeypatch.setattr(cli, "fetch_feeds", lambda *_args: [feed])
 
-    def post(url, *, headers, timeout):
-        calls.append((url, headers, timeout))
-        return _Response()
-
-    monkeypatch.setattr(cli.requests, "post", post)
-
-    assert cli.main(["enable", "lab/paper"]) == 0
-    assert calls[0][0].endswith(
-        "/v1/projects/018f47a8-a82b-7f10-8000-000000000001/feed-local/enable"
-    )
-    assert calls[0][1]["Authorization"] == "Bearer control-access"
-    assert calls[0][1]["Idempotency-Key"]
-    assert "Feed project data is enabled for lab/paper." in capsys.readouterr().out
+    assert cli.main(["list"]) == 0
+    assert store.load()["feeds"] == [feed]
+    assert "Paper/training\tprovisioning\towner" in capsys.readouterr().out

@@ -1,9 +1,8 @@
 # Feed for Python
 
-Log measurements and structured events from a Python process into a shared,
-project-scoped data source. Feed handles authentication, batching, retries, and
-delivery in a background thread; your application uses ordinary synchronous
-Python.
+Log measurements and structured events from Python. A feed is a shared logging
+destination inside a project. Feed handles authentication, batching, retries,
+and delivery in a background thread; application code stays synchronous.
 
 ## Get started
 
@@ -11,11 +10,11 @@ Python.
 uv add "feed @ git+https://github.com/linstromcloud/feed-python.git"
 ```
 
-Choose a Feed deployment and sign in:
+Sign in to an Analyze deployment and list the feeds you can use:
 
 ```sh
-uv run feed login https://feed.example.com/ingest
-uv run feed projects
+uv run feed login https://analyze.example.com
+uv run feed list
 ```
 
 `feed login` prints a browser URL and asks for a one-time code. On a cluster,
@@ -23,14 +22,18 @@ open the URL on any machine and paste the code into the login-node terminal.
 Your credentials are saved under `~/.config/feed/` and safely shared by jobs
 using the same home directory.
 
-If you can log to only one project, login selects it automatically. If several
-projects are available, choose a default once:
+`feed list` prints copyable `project/feed` references and their current status.
+If one feed is available, login selects it automatically. Otherwise, choose a
+default once:
 
 ```sh
-uv run feed use my-lab/my-project
+uv run feed use "Diffusion study/training"
 ```
 
-Then log a run without repeating the project:
+Create feeds in the Analyze project UI. Every project member with logging
+permission sees the same feeds after running `feed list`.
+
+Then log a run without repeating the selected feed:
 
 ```python
 import feed
@@ -57,32 +60,26 @@ with feed.init(
 The context manager flushes before the process exits. `run.id` is the UUID that
 links every row produced by that run.
 
-Pass `project="Project Name"` (or its UUID) or set `FEED_PROJECT` to override
-the saved default for one process. A project name must be unique among the
-projects available to the signed-in user. If several projects are available and
-no default has been selected, `feed.init()` raises an error listing the choices
+Pass the reference directly to override the saved default for one process:
+
+```python
+with feed.init("Diffusion study/evaluation", name="held-out") as run:
+    run.log("metrics", {"dataset": "test", "accuracy": 0.94})
+```
+
+The `FEED` environment variable provides the same override. If several feeds
+are available and no default is selected, `feed.init()` lists the choices
 instead of guessing a destination.
 
 For a complete UV environment and runnable example, see
 [`examples/uv`](examples/uv/README.md).
 
-## One-time project setup
-
-A project owner enables its queryable Feed source once:
-
-```sh
-uv run feed enable "Project Name"
-```
-
-Attach that source to any query workspace that should read the project. Other
-project members only need `feed login` (and `feed use` when they can access
-several projects); their existing permissions control logging and querying.
-
 ## The run API
 
 The high-level API has four concepts:
 
-- **Project** — the shared authorization and storage boundary.
+- **Project** — the authorization boundary that contains one or more feeds.
+- **Feed** — a shared logging destination selected as `project/feed`.
 - **Run** — one process or logical unit of work, with optional name, config,
   tags, and group.
 - **Stream name** — a named collection whose name becomes its logical query

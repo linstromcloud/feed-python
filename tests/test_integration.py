@@ -308,7 +308,7 @@ def test_names_lowercased_and_case_insensitive_on_wire(mock_server):
 def test_run_logs_map_names_and_record_shapes_to_wire_schemas(mock_server):
     url, server = mock_server
     run = init(
-        project="research-project",
+        "research-project",
         server_url=url,
         api_key="secret",
         name="baseline",
@@ -382,7 +382,7 @@ def test_run_logs_map_names_and_record_shapes_to_wire_schemas(mock_server):
 
 def test_run_rejects_invalid_stream_names_before_queueing(mock_server):
     url, _ = mock_server
-    run = init(project="research-project", server_url=url, api_key="secret")
+    run = init("research-project", server_url=url, api_key="secret")
 
     with pytest.raises(ValueError, match="stream name"):
         run.log("train metrics", {"loss": 1.0})

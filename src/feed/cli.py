@@ -1,4 +1,4 @@
-"""Terminal login and project discovery for Feed."""
+"""Terminal login and feed discovery."""
 
 from __future__ import annotations
 
@@ -19,9 +19,10 @@ from .credentials import (
     TokenProvider,
     _json_response,
     credential_control_url,
+    feed_reference,
+    fetch_feeds,
     fetch_projects,
-    project_reference,
-    resolve_project,
+    resolve_feed,
 )
 from .errors import AuthError
 
@@ -34,7 +35,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     subcommands = parser.add_subparsers(dest="command", required=True)
 
     login = subcommands.add_parser(
-        "login", help="sign in and cache your logging projects"
+        "login", help="sign in and cache feeds available for logging"
     )
     login.add_argument("deployment_url", nargs="?", metavar="URL")
     login.add_argument("--server-url")
@@ -42,30 +43,23 @@ def main(argv: Optional[List[str]] = None) -> int:
     login.add_argument("--provider", choices=("github", "entra", "magic_link"))
     login.add_argument("--organization")
 
-    projects = subcommands.add_parser(
-        "projects", help="refresh and list logging projects"
+    list_command = subcommands.add_parser(
+        "list", help="refresh and list available project/feed references"
     )
-    projects.add_argument("--no-refresh", action="store_true")
+    list_command.add_argument("--no-refresh", action="store_true")
 
-    use = subcommands.add_parser(
-        "use", help="select the default project for logging"
-    )
-    use.add_argument("project", help="unique project name or UUID")
-
-    enable = subcommands.add_parser(
-        "enable", help="enable the managed project catalog for querying"
-    )
-    enable.add_argument("project", help="unique project name or UUID")
+    use = subcommands.add_parser("use", help="select the default feed for logging")
+    use.add_argument("feed", help="project/feed reference printed by `feed list`")
 
     args = parser.parse_args(argv)
     try:
         if args.command == "login":
             return _login(args)
-        if args.command == "projects":
-            return _projects(not args.no_refresh)
+        if args.command == "list":
+            return _list(not args.no_refresh)
         if args.command == "use":
-            return _use(args.project)
-        return _enable(args.project)
+            return _use(args.feed)
+        raise AssertionError(f"unhandled command: {args.command}")
     except AuthError as exc:
         parser.exit(1, f"feed: {exc}\n")
 
@@ -77,9 +71,7 @@ def _login(args: argparse.Namespace) -> int:
         )
     server_url = args.server_url or args.deployment_url or os.environ.get("FEED_URL")
     if not server_url:
-        raise AuthError(
-            "deployment URL is required; run `feed login https://.../ingest`"
-        )
+        raise AuthError("deployment URL is required; run `feed login https://...`")
     server_origin = _origin(server_url)
     control_url = args.control_url or server_origin
     provider = args.provider or _select_provider(control_url)
@@ -127,10 +119,11 @@ def _login(args: argparse.Namespace) -> int:
     if not isinstance(refresh_token, str) or not isinstance(access_token, str):
         raise AuthError("authorization service returned an incomplete login response")
     project_records = fetch_projects(control_url, access_token)
+    feed_records = fetch_feeds(control_url, access_token, project_records)
 
-    default_project = (
-        str(project_records[0]["id"])
-        if len(project_records) == 1 and project_records[0].get("id")
+    default_feed = (
+        str(feed_records[0]["id"])
+        if len(feed_records) == 1 and feed_records[0].get("id")
         else None
     )
     credentials = {
@@ -140,95 +133,87 @@ def _login(args: argparse.Namespace) -> int:
         "device_guid": device_guid,
         "refresh_token": refresh_token,
         "projects": project_records,
+        "feeds": feed_records,
     }
-    if default_project is not None:
-        credentials["default_project"] = default_project
+    if default_feed is not None:
+        credentials["default_feed"] = default_feed
     CredentialStore().save(credentials)
-    print(f"Signed in. {len(project_records)} project(s) are available for logging.")
-    _print_projects(project_records, default_project)
-    if default_project is not None:
+    print(f"Signed in. {len(feed_records)} feed(s) are available for logging.")
+    _print_feeds(feed_records, default_feed)
+    if default_feed is not None:
         print(
-            "Using the only available project by default: "
-            f"{project_reference(default_project, project_records)}"
+            "Using the only available feed by default: "
+            f"{feed_reference(feed_records[0], feed_records)}"
         )
     return 0
 
 
-def _projects(refresh: bool) -> int:
+def _list(refresh: bool) -> int:
     store = CredentialStore()
     credentials = store.load()
-    records = credentials.get("projects", [])
+    records = credentials.get("feeds", [])
     if refresh:
         provider = TokenProvider(store)
-        records = fetch_projects(credential_control_url(credentials), provider.token())
-        store.update(lambda current: current.__setitem__("projects", records))
-    _print_projects(records, credentials.get("default_project"))
+        control_url = credential_control_url(credentials)
+        projects = fetch_projects(control_url, provider.token())
+        records = fetch_feeds(control_url, provider.token(), projects)
+
+        def update(current: Dict[str, Any]) -> None:
+            current["projects"] = projects
+            current["feeds"] = records
+
+        store.update(update)
+    _print_feeds(records, credentials.get("default_feed"))
     return 0
 
 
-def _use(project: str) -> int:
+def _use(feed: str) -> int:
     store = CredentialStore()
     credentials = store.load()
-    records = credentials.get("projects", [])
+    records = credentials.get("feeds", [])
+    refreshed_projects = None
     if not isinstance(records, list):
         records = []
 
     try:
-        project_id = resolve_project(project, records)
+        selected = resolve_feed(feed, records)
     except AuthError as error:
         if "ambiguous" in str(error):
             raise
-        project_id = ""
+        selected = {}
 
     if not any(
-        isinstance(record, dict) and record.get("id") == project_id
+        isinstance(record, dict) and record.get("id") == selected.get("id")
         for record in records
     ):
         provider = TokenProvider(store)
-        records = fetch_projects(credential_control_url(credentials), provider.token())
-        project_id = resolve_project(project, records)
-        if not any(record.get("id") == project_id for record in records):
-            raise AuthError(
-                f"project {project!r} is not available for logging; run `feed projects`"
-            )
+        control_url = credential_control_url(credentials)
+        refreshed_projects = fetch_projects(control_url, provider.token())
+        records = fetch_feeds(control_url, provider.token(), refreshed_projects)
+        selected = resolve_feed(feed, records)
 
     def select(current: Dict[str, Any]) -> None:
-        current["projects"] = records
-        current["default_project"] = project_id
+        if refreshed_projects is not None:
+            current["projects"] = refreshed_projects
+        current["feeds"] = records
+        current["default_feed"] = selected["id"]
 
     store.update(select)
-    reference = project_reference(project_id, records)
-    print(f"Default Feed project: {reference}")
+    print(f"Default feed: {feed_reference(selected, records)}")
     return 0
 
 
-def _enable(project: str) -> int:
-    store = CredentialStore()
-    credentials = store.load()
-    project_id = resolve_project(project, credentials.get("projects", []))
-    access_token = TokenProvider(store).token()
-    response = requests.post(
-        f"{credential_control_url(credentials)}/v1/projects/{project_id}/feed-local/enable",
-        headers={
-            "Authorization": f"Bearer {access_token}",
-            "Idempotency-Key": str(uuid.uuid4()),
-        },
-        timeout=15,
-    )
-    _json_response(response, f"enable Feed project {project}")
-    print(f"Feed project data is enabled for {project}.")
-    return 0
-
-
-def _print_projects(records: Any, default_project: Optional[str] = None) -> None:
+def _print_feeds(records: Any, default_feed: Optional[str] = None) -> None:
     if not records:
-        print("No projects with logging permission.")
+        print("No feeds are available for logging.")
         return
-    for project in records:
-        reference = project_reference(str(project["id"]), records)
-        organization = project.get("organization_slug") or "-"
-        selected = "\tdefault" if project.get("id") == default_project else ""
-        print(f"{reference}\t{organization}\t{project['role']}{selected}")
+    for feed in records:
+        reference = feed_reference(feed, records)
+        selected = "\tdefault" if feed.get("id") == default_feed else ""
+        print(
+            f"{reference}\t{feed.get('phase', 'pending')}\t"
+            f"{feed.get('role', '-')}{selected}"
+        )
 
 
 def _select_provider(control_url: str) -> str:
