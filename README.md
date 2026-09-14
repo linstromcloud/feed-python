@@ -146,20 +146,25 @@ and makes `log()` and `log_wait()` return `False` without inspecting the record.
 
 ## Delivery behavior
 
-`log` enqueues without waiting for HTTP and returns whether the data was
-accepted locally. A background worker batches and uploads records based on size
-and time thresholds.
+`log` builds the event, checks its complete schema and data against the size
+limit, then encodes and admits it to memory without disk or HTTP I/O. `True`
+means memory admission. The background worker persists records
+before uploading them. Persistence runs when queued bytes reach 256 KiB or the
+one-second interval expires; channel event thresholds and explicit flushes can
+also trigger it. Network failures, authentication failures, and unavailable
+filtering rules do not stop local persistence.
 
-Transient network failures and server errors retry with jittered exponential
-backoff. Oversized batches are split automatically. Queues and retries are held
-in memory, so the context manager—or an explicit `finish()`—is important before
+A crash can lose records still awaiting persistence. The interval is a target,
+not a maximum loss window: slow or failed storage can extend it. The context
+manager calls `finish()` to save queued records and wait for delivery before
 the process exits:
 
 ```python
 report = run.finish(timeout=30)
 if not report.successful:
     raise RuntimeError(
-        f"delivery incomplete: dropped={report.dropped}, pending={report.pending}"
+        f"delivery incomplete: persisted={report.persisted_pending}, "
+        f"unsaved={report.unsaved}, failed={report.failed}"
     )
 ```
 
@@ -172,6 +177,113 @@ report = run.flush(timeout=30)
 if not accepted or not report.successful:
     raise RuntimeError("Feed delivery is incomplete")
 ```
+
+The defaults bound encoded queue data to 16 MiB per run and each encoded event,
+including its schema, to 4 MiB. Oversized events return `False` with a warning;
+`log_wait` rejects a completed event that cannot fit without waiting for queue
+capacity. Queued records and records awaiting persistence share the memory
+budget. Size is checked once after construction; type validation and event
+construction can allocate memory before that check. Upload encoding/compression
+and the spool's filename index require additional working memory. These limits
+do not establish an OS process-memory limit.
+
+The shared spool defaults to 1 GiB at `~/.local/state/feed/spool/`, or under
+`XDG_STATE_HOME` when set. `FEED_SPOOL_DIR` overrides its location. The quota
+includes conservative file/metadata charges and outstanding reservations across
+all runs and projects. The worker reserves space for its pending writes and
+releases unused credit. Idle runs reserve only their bookkeeping space (32 KiB
+per run), with no event allowance. A full spool leaves accepted records in the
+bounded memory queue; further calls return `False` when that queue fills.
+`log_wait` waits for queue space, and `finish` reports any remaining `unsaved`
+records. Persistence preserves channel order. Existing records are never evicted
+to admit new ones.
+
+Configure these limits when starting a run:
+
+```python
+run = feed.init(
+    max_spool_bytes=1024**3,
+    memory_queue_bytes=32 * 1024**2,
+    max_event_bytes=8 * 1024**2,
+    persist_interval_seconds=1.0,
+    persist_threshold_bytes=256 * 1024,
+)
+```
+
+The event limit must be at most half the queue byte budget and at most 64 MiB.
+An explicit `max_spool_bytes` updates the shared directory's budget under its
+quota lock; it cannot lower the budget below stored and reserved usage. Omit it
+to use the existing budget, or the 1 GiB default for a new directory.
+
+Transient failures retry with capped, jittered backoff and honor `Retry-After`.
+Waiting batches retain ticket lists in memory; their payloads stay on disk.
+Retry timing resets after restart. Upload workers reuse their HTTP sessions.
+The legacy `max_retries`, `max_retry_queue_depth`, and
+`max_blacklist_fetch_attempts` options remain accepted; they no longer discard
+durable records or disable recording. Channel priorities, rate limits, queue
+counts, upload thresholds, and per-channel/global upload slots still apply.
+The run API gives metadata priority over data. Priority selects waiting uploads;
+it cannot preempt an in-flight HTTP request.
+
+An HTTP 413 splits a batch. An individually oversized or permanently rejected
+upload remains in a `.failed` file with its error. Later eligible metrics can
+upload while that record is failed, delayed, or in flight. Overall capacity
+still bounds admission during an outage.
+
+`flush()` waits for the records admitted before its call. `finish()` closes
+admission, prioritizes persistence, and waits for uploads within its deadline.
+If disk writes cannot finish within that time, `unsaved` reports the remaining
+memory records. A stalled filesystem call may continue in the daemon worker.
+Reports distinguish `delivered`, `filtered`, `failed`, `persisted_pending`, and
+`unsaved`; `pending` includes both persisted and unsaved records. `dropped` is
+the legacy name for `failed`. A successful report requires remote
+acknowledgement or explicit filtering for every covered record. It does not
+mean the data has reached the lake. Recovered runs are separate from a new
+run's delivery report.
+
+### Recover saved records
+
+While a run is active, delivery resumes when the endpoint becomes available.
+A new `feed.init()` also recovers inactive spools for its selected deployment,
+project, and feed. Cached member credentials supply stable IDs. API-key runs
+match the original URL, feed reference, endpoint, and key fingerprint. Other
+projects remain untouched.
+
+After a job exits, inspect and synchronize every saved destination:
+
+```sh
+feed status
+feed sync
+feed sync --timeout 10 --json
+```
+
+`feed sync` resolves each destination using the current login or the matching
+`FEED_API_KEY`. It attempts each outstanding record once, including previously
+failed records, and splits oversized batches. Unavailable destinations retain
+their records while the command continues with other runs. The timeout applies
+to each HTTP request, not the complete pass. A subsequent invocation can retry
+remaining work. An empty or fully delivered pass exits zero; pending records,
+failed records, active owners, and errors produce a nonzero exit status.
+
+An active run keeps exclusive ownership. Sync requests a flush from its worker
+and reports the run as active; it does not start a competing uploader. Both
+commands accept `--spool-dir` and `--json`. Status describes files already on
+disk; unpersisted memory records remain visible through the producing run's
+delivery report.
+
+Recovery preserves session IDs, channel sequences, captured data, and schemas.
+Uploads require a valid ingestion acknowledgement before deleting saved records.
+If the server accepts a request but its response is lost, recovery can send it
+again with the same identity. Delivery is at least once; downstream identity
+deduplication handles those repeated attempts.
+
+Spools use private directories and files, immutable event files, atomic rename,
+and synced writes. They store destination metadata and an API-key fingerprint,
+never access tokens, refresh tokens, or API keys. A shared filesystem must
+provide working POSIX `flock`, atomic rename, and `fsync` semantics. The process
+and quota tests run on local POSIX storage; validate these semantics on the
+cluster's actual shared filesystem. Node-local temporary storage does not
+survive deletion of that storage.
 
 Concurrent processes may use the same cached login. Refresh-token rotation is
 protected by a file lock. Set `FEED_CREDENTIALS_FILE` if each process needs a

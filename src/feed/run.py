@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass, field
 from typing import Any, Iterable, Mapping, Optional, Union, overload
 
@@ -37,6 +38,12 @@ def init(
     enabled: bool = True,
     max_retries: Optional[int] = None,
     max_retry_queue_depth: Optional[int] = None,
+    spool_dir: Optional[str] = None,
+    max_spool_bytes: Optional[int] = None,
+    memory_queue_bytes: int = 16 * 1024**2,
+    max_event_bytes: int = 4 * 1024**2,
+    persist_interval_seconds: float = 1.0,
+    persist_threshold_bytes: int = 256 * 1024,
 ) -> "Run":
     """Start a run in a shared feed.
 
@@ -70,6 +77,16 @@ def init(
         bearer_token_provider=token_provider,
         channels=list(_STANDARD_CHANNELS),
         enabled=enabled,
+        spool_dir=spool_dir,
+        max_spool_bytes=max_spool_bytes,
+        memory_queue_bytes=memory_queue_bytes,
+        max_event_bytes=max_event_bytes,
+        persist_interval_seconds=persist_interval_seconds,
+        persist_threshold_bytes=persist_threshold_bytes,
+        project_id=getattr(token_provider, "project_id", None),
+        feed_id=getattr(token_provider, "feed_id", None),
+        control_url=getattr(token_provider, "control_url", None),
+        feed_reference=feed_reference,
     )
     if max_retries is not None:
         client_config.max_retries = max_retries
@@ -198,7 +215,16 @@ class Run:
 
     def finish(self, timeout: float = 10.0) -> DeliveryReport:
         """Flush pending events, stop the worker, and return its delivery report."""
-        return self._client.shutdown(timeout)
+        report = self._client.shutdown(timeout)
+        if not report.successful:
+            logging.getLogger("feed").warning(
+                "feed: finish incomplete: persisted_pending=%d unsaved=%d failed=%d; spool=%s",
+                report.persisted_pending,
+                report.unsaved,
+                report.failed,
+                report.spool_path,
+            )
+        return report
 
     def __enter__(self) -> "Run":
         return self

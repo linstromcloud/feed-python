@@ -1,16 +1,11 @@
-"""Delivery tracking for acknowledged flushes.
-
-Delivery tickets are local-only identifiers. They let callers wait for events
-accepted before a flush without changing their remote identity.
-"""
+"""Constant-space delivery counters split at the current flush watermark."""
 
 from __future__ import annotations
 
 import threading
 import time
+from collections import Counter
 from dataclasses import dataclass
-from typing import Dict, Iterable, Set
-
 
 DELIVERED = "delivered"
 FILTERED = "filtered"
@@ -19,14 +14,6 @@ DROPPED = "dropped"
 
 @dataclass(frozen=True)
 class DeliveryReport:
-    """Outcome for events accepted since the previous completed flush.
-
-    ``complete`` means that every accepted event covered by this flush has
-    reached a terminal outcome. ``successful`` additionally requires that no
-    event was dropped. Events filtered by an explicit server rule are terminal
-    but are reported separately.
-    """
-
     accepted: int
     delivered: int
     filtered: int
@@ -34,88 +21,105 @@ class DeliveryReport:
     pending: int
     complete: bool
     timed_out: bool
+    persisted_pending: int = 0
+    unsaved: int = 0
+    spool_path: str = ""
+    storage_error: str = ""
 
     @property
-    def successful(self) -> bool:
-        return self.complete and self.dropped == 0
+    def successful(self):
+        return self.complete and self.dropped == 0 and not self.storage_error
+
+    @property
+    def failed(self):
+        """Rejected uploads retained on disk; ``dropped`` is the legacy name."""
+        return self.dropped
 
 
 class DeliveryTracker:
-    """Thread-safe accepted-event tracker shared by emitters and the worker."""
+    """The worker settles each owned record once; no per-event history remains.
 
-    def __init__(self) -> None:
+    Client serializes flush calls. A watermark separates current counts from
+    later admissions, including uploads that finish out of order.
+    """
+
+    def __init__(self):
         self._condition = threading.Condition()
         self._next_ticket = 0
-        self._pending: Set[int] = set()
-        self._outcomes: Dict[int, str] = {}
-        self._reported_through = -1
+        self._boundary = None
+        self._current, self._later = Counter(), Counter()
+        self.spool_path = ""
+        self.storage_error = ""
 
-    def begin(self) -> int:
-        """Reserve a ticket before attempting to place an event in a queue."""
+    def _counts(self, ticket):
+        return (
+            self._later
+            if self._boundary is not None and ticket > self._boundary
+            else self._current
+        )
+
+    def begin(self):
         with self._condition:
             ticket = self._next_ticket
             self._next_ticket += 1
-            self._pending.add(ticket)
+            counts = self._counts(ticket)
+            counts["accepted"] += 1
+            counts["unsaved"] += 1
             return ticket
 
-    def reject(self, ticket: int) -> None:
-        """Discard a ticket for an event that was never accepted by a queue."""
+    def reject(self, ticket):
         with self._condition:
-            self._pending.discard(ticket)
+            counts = self._counts(ticket)
+            counts["accepted"] -= 1
+            counts["unsaved"] -= 1
             self._condition.notify_all()
 
-    def settle(self, tickets: Iterable[int], outcome: str) -> None:
-        """Mark accepted tickets delivered, filtered, or permanently dropped."""
+    def persisted(self, ticket):
+        with self._condition:
+            self._counts(ticket)["unsaved"] -= 1
+            self._condition.notify_all()
+
+    def settle(self, tickets, outcome):
         with self._condition:
             for ticket in tickets:
-                if ticket not in self._pending:
-                    continue
-                self._pending.remove(ticket)
-                self._outcomes[ticket] = outcome
+                self._counts(ticket)[outcome] += 1
             self._condition.notify_all()
 
-    def watermark(self) -> int:
+    def watermark(self):
         with self._condition:
-            return self._next_ticket - 1
+            self._current.update(self._later)
+            self._later.clear()
+            self._boundary = self._next_ticket - 1
+            return self._boundary
 
-    def wait(self, watermark: int, timeout: float) -> DeliveryReport:
-        """Wait for all accepted tickets through ``watermark`` to settle."""
-        deadline = time.monotonic() + max(0.0, timeout)
+    def _pending(self):
+        c = self._current
+        return c["accepted"] - c[DELIVERED] - c[FILTERED] - c[DROPPED]
+
+    def wait(self, watermark, timeout):
+        deadline = time.monotonic() + max(0, timeout)
         with self._condition:
-            while self._has_pending_through(watermark):
+            while self._pending():
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
                 self._condition.wait(remaining)
-
-            pending = sum(
-                1
-                for ticket in self._pending
-                if self._reported_through < ticket <= watermark
-            )
-            outcomes = [
-                outcome
-                for ticket, outcome in self._outcomes.items()
-                if self._reported_through < ticket <= watermark
-            ]
-            complete = pending == 0
+            c = self._current
+            pending = self._pending()
             report = DeliveryReport(
-                accepted=len(outcomes) + pending,
-                delivered=outcomes.count(DELIVERED),
-                filtered=outcomes.count(FILTERED),
-                dropped=outcomes.count(DROPPED),
-                pending=pending,
-                complete=complete,
-                timed_out=not complete,
+                c["accepted"],
+                c[DELIVERED],
+                c[FILTERED],
+                c[DROPPED],
+                pending,
+                pending == 0,
+                pending != 0,
+                pending - c["unsaved"],
+                c["unsaved"],
+                self.spool_path,
+                self.storage_error,
             )
-
-            if complete and watermark > self._reported_through:
-                for ticket in list(self._outcomes):
-                    if ticket <= watermark:
-                        del self._outcomes[ticket]
-                self._reported_through = watermark
-
+            if not pending:
+                self._current, self._later = self._later, Counter()
+                self._boundary = None
             return report
-
-    def _has_pending_through(self, watermark: int) -> bool:
-        return any(ticket <= watermark for ticket in self._pending)

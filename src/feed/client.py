@@ -4,6 +4,10 @@ from __future__ import annotations
 
 import uuid
 import threading
+import hashlib
+import logging
+import json
+import math
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -13,6 +17,8 @@ from .delivery import DeliveryReport, DeliveryTracker
 from .errors import ConfigError
 from .fields import Field, FieldType, _infer_field, _normalize_name
 from .state import StateStore
+from .limits import Admission
+from .spool import SpoolRoot, MAX_RECORD_BYTES
 from .worker import Worker, WorkerState
 
 
@@ -38,6 +44,9 @@ class Client:
         self._state = StateStore()
         self._delivery = DeliveryTracker()
         self._flush_lock = threading.Lock()
+        self._config = config
+        self._admission = None
+        self._wake = threading.Event()
 
         # Channel names are lowercased so lookup/registration is case-insensitive.
         settings: List[ChannelSettings] = []
@@ -46,8 +55,32 @@ class Client:
         if not any(s.name == DEFAULT_CHANNEL for s in settings):
             settings.insert(0, ChannelSettings(DEFAULT_CHANNEL))
 
+        spool = None
+        if self._enabled:
+            destination = {
+                "server_url": config.server_url.rstrip("/"),
+                "endpoint_id": config.endpoint_id,
+                "project_id": config.project_id,
+                "feed_id": config.feed_id,
+                "control_url": config.control_url,
+                "feed_reference": config.feed_reference,
+                "auth": "member" if config.bearer_token_provider else "api_key",
+                "key_id": hashlib.sha256(config.client_secret.encode()).hexdigest()
+                if config.client_secret is not None
+                else None,
+                "channels": [s.__dict__ for s in settings],
+            }
+            if len(json.dumps(destination).encode()) + 256 * len(settings) > 7500:
+                raise ConfigError(
+                    "channel and destination metadata exceed the spool header budget"
+                )
+            root = SpoolRoot(config.spool_dir, config.max_spool_bytes)
+            spool = root.create(destination, self._session_id, 0)
+            self._admission = Admission(config.memory_queue_bytes, self._wake)
+            self._delivery.spool_path = str(spool.path)
         self._handles: List[ChannelHandle] = [
-            ChannelHandle(s, self._delivery) for s in settings
+            ChannelHandle(s, self._delivery, self._admission, config.max_event_bytes)
+            for s in settings
         ]
         self._channel_index: Dict[str, int] = {
             s.name: i for i, s in enumerate(settings)
@@ -57,7 +90,13 @@ class Client:
         self._worker: Optional[Worker] = None
         if self._enabled:
             self._worker = Worker(
-                config, self._session_id, self._handles, self._delivery
+                config,
+                self._session_id,
+                self._handles,
+                self._delivery,
+                spool,
+                self._admission,
+                self._wake,
             )
             self._worker.start()
 
@@ -82,6 +121,10 @@ class Client:
     def enabled(self) -> bool:
         """Whether this client was configured to send data."""
         return self._enabled
+
+    @property
+    def max_event_bytes(self):
+        return self._config.max_event_bytes
 
     # --- channels ---------------------------------------------------------
 
@@ -221,10 +264,10 @@ class Client:
 
 
 def _validate(config: Config) -> None:
-    if not config.endpoint_id or not config.endpoint_id.strip():
-        raise ConfigError("endpoint_id must not be empty")
     if not config.enabled:
         return
+    if not config.endpoint_id or not config.endpoint_id.strip():
+        raise ConfigError("endpoint_id must not be empty")
     url = config.server_url.strip()
     if not (url.startswith("http://") or url.startswith("https://")):
         raise ConfigError(f"invalid server_url: {config.server_url!r}")
@@ -238,3 +281,29 @@ def _validate(config: Config) -> None:
         if key in seen:
             raise ConfigError(f"duplicate channel name: {c.name!r}")
         seen.add(key)
+        _normalize_name(key, "channel name")
+        if len(key) > 200:
+            raise ConfigError("channel names must contain at most 200 characters")
+    if (
+        not 0
+        < config.max_event_bytes
+        <= min(MAX_RECORD_BYTES, config.memory_queue_bytes // 2)
+    ):
+        raise ConfigError(
+            "max_event_bytes must be positive, at most 64 MiB, and at most half memory_queue_bytes"
+        )
+    for name in (
+        "persist_interval_seconds",
+        "persist_threshold_bytes",
+        "upload_batch_bytes",
+        "upload_timeout_seconds",
+        "blacklist_timeout_seconds",
+        "retry_base_delay_seconds",
+        "retry_max_delay_seconds",
+    ):
+        if not math.isfinite(getattr(config, name)) or getattr(config, name) <= 0:
+            raise ConfigError(f"{name} must be positive")
+    if config.max_retries != 0 or config.max_retry_queue_depth != 0:
+        logging.getLogger("feed").debug(
+            "feed: durable storage retains retries; legacy retry count/depth limits do not discard events"
+        )

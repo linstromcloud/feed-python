@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import base64
 import hashlib
+import json
 import os
 import secrets
 import sys
@@ -51,8 +52,60 @@ def main(argv: Optional[List[str]] = None) -> int:
     use = subcommands.add_parser("use", help="select the default feed for logging")
     use.add_argument("feed", help="project/feed reference printed by `feed list`")
 
+    for command in ("sync", "status"):
+        recovery = subcommands.add_parser(
+            command,
+            help=(
+                "upload outstanding records across saved projects and feeds"
+                if command == "sync"
+                else "inspect locally persisted records"
+            ),
+        )
+        recovery.add_argument("--spool-dir")
+        recovery.add_argument("--json", action="store_true")
+        if command == "sync":
+            recovery.add_argument(
+                "--timeout",
+                type=float,
+                default=30,
+                help="timeout per HTTP request in seconds (default: 30)",
+            )
+
     args = parser.parse_args(argv)
     try:
+        if args.command in ("sync", "status"):
+            from .sync import status, sync_spools
+
+            if args.command == "sync" and args.timeout <= 0:
+                parser.error("--timeout must be positive")
+            report = (
+                sync_spools(args.spool_dir, args.timeout)
+                if args.command == "sync"
+                else status(args.spool_dir)
+            )
+            if args.json:
+                print(json.dumps(report))
+            else:
+                print(
+                    " ".join(
+                        f"{key}={value}"
+                        for key, value in report.items()
+                        if key not in ("runs", "errors")
+                    )
+                )
+                for item in report.get("runs", []):
+                    print(json.dumps(item))
+                for error in report.get("errors", []):
+                    print(f"feed: {error}", file=sys.stderr)
+            return int(
+                args.command == "sync"
+                and bool(
+                    report["pending"]
+                    or report["failed"]
+                    or report["active"]
+                    or report["errors"]
+                )
+            )
         if args.command == "login":
             return _login(args)
         if args.command == "list":
@@ -60,7 +113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         if args.command == "use":
             return _use(args.feed)
         raise AssertionError(f"unhandled command: {args.command}")
-    except AuthError as exc:
+    except (AuthError, OSError, ValueError) as exc:
         parser.exit(1, f"feed: {exc}\n")
 
 

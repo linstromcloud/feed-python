@@ -4,40 +4,17 @@ sequence-number counter, and an optional token-bucket rate limiter.
 
 from __future__ import annotations
 
-import itertools
 import queue
 import threading
 import time
-from typing import List, Tuple
-
-from .config import ChannelSettings
-from .delivery import DeliveryTracker
-from .fields import Field
 
 
 class QueuedEvent:
-    """A raw event handed from the emitter to the worker. The worker does the
-    merge, hash, and blacklist work — the emit path stays cheap.
-    """
-
-    __slots__ = ("seq", "delivery_ticket", "schema_name", "event_fields", "state")
-
-    def __init__(
-        self,
-        seq: int,
-        delivery_ticket: int,
-        schema_name: str,
-        event_fields: List[Field],
-        state: Tuple[Field, ...],
-    ) -> None:
-        #: Raw per-channel sequence assigned at emit. The worker subtracts the
-        #: running blacklist-drop count to produce the wire sequence, so blacklist
-        #: drops close the gap while queue-full drops leave one.
-        self.seq = seq
-        self.delivery_ticket = delivery_ticket
-        self.schema_name = schema_name
-        self.event_fields = event_fields
-        self.state = state
+    def __init__(self, ticket, payload, channel):
+        self.delivery_ticket = ticket
+        self.payload = payload
+        self.channel = channel
+        self.reserved = False
 
 
 class _TokenBucket:
@@ -65,69 +42,94 @@ class _TokenBucket:
 
 
 class ChannelHandle:
-    """The emitter-side handle for one channel."""
+    """Channel admission retains count limits, sequencing and rate limiting."""
 
-    __slots__ = ("settings", "queue", "_seq", "_rate", "_delivery")
-
-    def __init__(self, settings: ChannelSettings, delivery: DeliveryTracker) -> None:
-        self.settings = settings
-        self.queue: "queue.Queue[QueuedEvent]" = queue.Queue(
-            maxsize=max(1, settings.queue_capacity)
-        )
-        self._seq = itertools.count()  # next() is atomic under CPython
-        self._delivery = delivery
+    def __init__(self, settings, delivery, admission=None, max_event_bytes=4 * 1024**2):
+        self.settings, self._delivery = settings, delivery
+        self._admission = admission
+        self._max_event_bytes = max_event_bytes
+        self.queue = queue.Queue(maxsize=max(1, settings.queue_capacity))
+        self._seq = 0
+        self._last_warning = 0
+        self._lock = threading.Lock()
         self._rate = (
             _TokenBucket(settings.max_events_per_second)
             if settings.max_events_per_second > 0
             else None
         )
 
-    def try_emit(
-        self, schema_name: str, event_fields: List[Field], state: Tuple[Field, ...]
-    ) -> bool:
-        """Attempt to emit a raw event. Returns ``False`` if rate-limited or the
-        queue is full (both are non-blocking drops).
+    def try_emit(self, schema_name, event_fields, state):
+        return self._emit(schema_name, event_fields, state, None)
 
-        Mirrors the other clients: rate-limit drops happen before a sequence
-        number is consumed (no gap); queue-full drops happen after (leaving a gap
-        that signals data loss).
-        """
-        ticket = self._delivery.begin()
-        if self._rate is not None and not self._rate.try_take():
-            self._delivery.reject(ticket)
+    def emit_wait(self, schema_name, event_fields, state, timeout):
+        return self._emit(schema_name, event_fields, state, max(0, timeout))
+
+    def _warn(self, message):
+        import logging
+
+        now = time.monotonic()
+        if now - self._last_warning >= 1:
+            logging.getLogger("feed").warning("feed: %s; record rejected", message)
+            self._last_warning = now
+
+    def _emit(self, schema_name, event_fields, state, timeout):
+        from .limits import EventTooLarge, encode_record
+        from .protocol import build_event
+        from .state import merge
+
+        deadline = time.monotonic() + (timeout or 0)
+        admission = self._admission
+        if admission is None or not admission.accepting:
             return False
-        seq = next(self._seq)
-        event = QueuedEvent(seq, ticket, schema_name, event_fields, state)
+        schema_hash, schema_def, data = build_event(
+            schema_name, merge(state, event_fields)
+        )
         try:
-            self.queue.put_nowait(event)
-            return True
-        except queue.Full:
-            self._delivery.reject(ticket)
+            body = encode_record(
+                {
+                    "channel": self.settings.name.lower(),
+                    "schema_hash": schema_hash,
+                    "schema_def": schema_def,
+                    "data": data,
+                },
+                self._max_event_bytes,
+            )
+        except EventTooLarge as exc:
+            self._warn(str(exc))
             return False
-
-    def emit_wait(
-        self,
-        schema_name: str,
-        event_fields: List[Field],
-        state: Tuple[Field, ...],
-        timeout: float,
-    ) -> bool:
-        """Wait up to ``timeout`` seconds for queue capacity."""
-        deadline = time.monotonic() + max(0.0, timeout)
-        ticket = self._delivery.begin()
-        if self._rate is not None:
-            while not self._rate.try_take():
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    self._delivery.reject(ticket)
+        rate_taken = self._rate is None
+        while True:
+            # Capacity waits happen outside this lock: a waiting large record
+            # cannot prevent a smaller record from using available capacity.
+            with self._lock:
+                if not admission.accepting or admission.error:
                     return False
-                time.sleep(min(0.01, remaining))
-
-        seq = next(self._seq)
-        event = QueuedEvent(seq, ticket, schema_name, event_fields, state)
-        try:
-            self.queue.put(event, timeout=max(0.0, deadline - time.monotonic()))
-            return True
-        except queue.Full:
-            self._delivery.reject(ticket)
-            return False
+                if not rate_taken:
+                    rate_taken = self._rate.try_take()
+                if rate_taken and not self.queue.full():
+                    ticket = self._delivery.begin()
+                    payload = (b'{"ticket":%d,"seq":%d,' % (ticket, self._seq)) + body[
+                        1:
+                    ]
+                    if len(payload) > self._max_event_bytes:
+                        self._delivery.reject(ticket)
+                        self._warn(
+                            f"event exceeds max_event_bytes={self._max_event_bytes}"
+                        )
+                        return False
+                    if admission.reserve(len(payload)):
+                        self._seq += 1
+                        self.queue.put_nowait(
+                            QueuedEvent(ticket, payload, self.settings.name)
+                        )
+                        admission.wake.set()
+                        return True
+                    self._delivery.reject(ticket)
+                remaining = deadline - time.monotonic()
+                if timeout is None or remaining <= 0:
+                    if rate_taken:
+                        self._seq += 1
+                    self._warn("channel or byte capacity unavailable")
+                    return False
+            with admission.condition:
+                admission.condition.wait(min(remaining, 0.05))

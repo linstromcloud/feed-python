@@ -146,6 +146,11 @@ class TokenProvider:
     def __call__(self) -> str:
         return self.token("feed")
 
+    def invalidate(self) -> None:
+        """Discard a rejected access token so the next attempt refreshes it."""
+        with self._mutex:
+            self._cache.pop("feed", None)
+
     def token(self, resource: Optional[str] = None) -> str:
         cache_key = resource or ""
         with self._mutex:
@@ -265,6 +270,9 @@ def authenticated_feed(
     if not ingest_url.endswith(suffix):
         raise AuthError(f"feed {reference!r} returned an invalid ingest URL")
     discovered_url = ingest_url[: -len(suffix)]
+    provider.project_id = selected.get("project_id")
+    provider.feed_id = selected.get("id")
+    provider.control_url = credential_control_url(credentials)
     return (server_url or discovered_url).rstrip("/"), slug, provider, reference
 
 

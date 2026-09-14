@@ -21,8 +21,8 @@ class Defaults:
 
     RETRY_BASE_DELAY_SECONDS = 1.0
     RETRY_MAX_DELAY_SECONDS = 60.0
-    MAX_RETRIES = 5
-    MAX_RETRY_QUEUE_DEPTH = 50
+    MAX_RETRIES = 0
+    MAX_RETRY_QUEUE_DEPTH = 0
 
     BLACKLIST_TIMEOUT_SECONDS = 10.0
     UPLOAD_TIMEOUT_SECONDS = 30.0
@@ -69,16 +69,16 @@ class Config:
     channels: List[ChannelSettings] = field(default_factory=list)
     #: Client-wide cap on concurrently in-flight uploads.
     max_concurrent_requests: int = Defaults.MAX_CONCURRENT_REQUESTS
-    #: Cap on blacklist-fetch retries before telemetry is disabled. 0 = forever.
+    #: Legacy option. Filtering rules retry while local persistence continues.
     max_blacklist_fetch_attempts: int = Defaults.MAX_BLACKLIST_FETCH_ATTEMPTS
     #: Initial retry backoff (seconds).
     retry_base_delay_seconds: float = Defaults.RETRY_BASE_DELAY_SECONDS
     #: Maximum retry backoff (seconds).
     retry_max_delay_seconds: float = Defaults.RETRY_MAX_DELAY_SECONDS
-    #: Maximum retries for a single batch before it is dropped. 0 retries
-    #: indefinitely, which is suitable for acknowledged export pipelines.
+    #: Legacy option, retained for source compatibility. Durable retries do not
+    #: discard records after an attempt count.
     max_retries: int = Defaults.MAX_RETRIES
-    #: Maximum number of batches held awaiting retry. 0 is unlimited.
+    #: Legacy option. The spool quota and upload slots now bound retries.
     max_retry_queue_depth: int = Defaults.MAX_RETRY_QUEUE_DEPTH
     #: Blacklist-fetch request timeout (seconds).
     blacklist_timeout_seconds: float = Defaults.BLACKLIST_TIMEOUT_SECONDS
@@ -86,3 +86,16 @@ class Config:
     upload_timeout_seconds: float = Defaults.UPLOAD_TIMEOUT_SECONDS
     #: Master switch. When False, no worker or network connection is created.
     enabled: bool = True
+    #: Shared spool quota and bounded producer/upload payloads, in bytes.
+    spool_dir: Optional[str] = None
+    max_spool_bytes: Optional[int] = None
+    memory_queue_bytes: int = 16 * 1024**2
+    max_event_bytes: int = 4 * 1024**2
+    persist_threshold_bytes: int = 256 * 1024
+    persist_interval_seconds: float = 1.0
+    upload_batch_bytes: int = 256 * 1024
+    #: Stable member-authenticated destination identity.
+    project_id: Optional[str] = None
+    feed_id: Optional[str] = None
+    control_url: Optional[str] = None
+    feed_reference: str = ""
