@@ -78,7 +78,8 @@ def test_rotated_refresh_is_atomic_private_and_cached(tmp_path, monkeypatch):
     assert calls[0][1]["refresh_token"] == "refresh-1"
     assert calls[0][1]["resource"] == "feed"
     assert store.load()["refresh_token"] == "refresh-2"
-    assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o600
+    if os.name != "nt":  # Windows access is controlled by inherited ACLs.
+        assert stat.S_IMODE(os.stat(store.path).st_mode) == 0o600
 
 
 def test_control_token_uses_default_auth_resource(tmp_path, monkeypatch):
@@ -200,3 +201,50 @@ def test_authenticated_feed_uses_sole_cached_feed(tmp_path):
     assert url == "https://paper.feed.test"
     assert slug == "paper"
     assert reference == "Research/paper"
+
+
+def test_concurrent_processes_serialize_credential_updates(tmp_path):
+    import subprocess
+    import sys
+
+    store = CredentialStore(tmp_path / "credentials.json")
+    store.save(_credentials("0"))
+    script = """
+import sys, time
+from pathlib import Path
+from feed.credentials import CredentialStore
+store = CredentialStore(Path(sys.argv[1]))
+print("ready", flush=True)
+sys.stdin.readline()
+def advance(credentials):
+    previous = int(credentials["refresh_token"])
+    time.sleep(0.01)
+    credentials["refresh_token"] = str(previous + 1)
+for _ in range(10):
+    store.update(advance)
+"""
+    children = [
+        subprocess.Popen(
+            [sys.executable, "-c", script, str(store.path)],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(4)
+    ]
+    try:
+        for child in children:
+            assert child.stdout.readline().strip() == "ready"
+        for child in children:
+            child.stdin.write("go\n")
+            child.stdin.flush()
+        for child in children:
+            _, error = child.communicate(timeout=15)
+            assert child.returncode == 0, error
+        assert store.load()["refresh_token"] == "40"
+    finally:
+        for child in children:
+            if child.poll() is None:
+                child.kill()
+                child.wait()
