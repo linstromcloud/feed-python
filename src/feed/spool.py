@@ -1,9 +1,9 @@
-"""Bounded, exclusively owned run spools on a shared POSIX filesystem.
+"""Bounded, exclusively owned run spools on a shared filesystem.
 
 Each event is an immutable JSON file. Atomic rename publishes synced records;
 acknowledgement removes them. Retry metadata never changes the event identity.
 A root lock coordinates disk reservations; producers consume reserved credit
-in memory. Filesystems must support flock, atomic rename and fsync.
+in memory. Filesystems must support process locks, atomic rename and file fsync.
 """
 
 from __future__ import annotations
@@ -17,11 +17,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from .errors import ConfigError
-
-try:
-    import fcntl
-except ImportError:
-    fcntl = None
+from ._filesystem import lock, sync_directory as _sync_directory
 
 ROOT_OVERHEAD = 32768
 RUN_OVERHEAD = 32768
@@ -46,14 +42,6 @@ def default_spool_path():
             ),
         )
     ).expanduser()
-
-
-def _sync_directory(path):
-    fd = os.open(path, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
 
 
 def _atomic(path, data):
@@ -88,7 +76,7 @@ def _read_json(path, limit=65536):
 def _lock_owner(path):
     fd = os.open(path / "owner.lock", os.O_CREAT | os.O_RDWR, 0o600)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        lock(fd, blocking=False)
     except BlockingIOError:
         os.close(fd)
         return None
@@ -115,8 +103,6 @@ def same_destination(left, right):
 
 class SpoolRoot:
     def __init__(self, path=None, max_bytes=None):
-        if fcntl is None:
-            raise ConfigError("Feed persistence requires POSIX flock support")
         self.path = Path(path) if path is not None else default_spool_path()
         self.path.mkdir(mode=0o700, parents=True, exist_ok=True)
         self.max_bytes = max_bytes
@@ -149,7 +135,7 @@ class SpoolRoot:
     def locked(self):
         fd = os.open(self.path / "quota.lock", os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            fcntl.flock(fd, fcntl.LOCK_EX)
+            lock(fd)
             policy = self.path / "budget.json"
             if policy.exists():
                 stored = _read_json(policy)
@@ -465,17 +451,18 @@ class RunSpool:
             if self._closed:
                 return
             self._closed = True
-            try:
-                counts = self.counts()
-                if not any(counts.values()):
-                    for path in self.path.iterdir():
-                        if path.is_dir():
-                            for child in path.iterdir():
-                                child.unlink()
-                            path.rmdir()
-                        else:
-                            path.unlink()
-                    self.path.rmdir()
-                    _sync_directory(self.root.path)
-            finally:
-                os.close(self._owner_fd)
+            # The root lock excludes claims while Windows releases the handle
+            # required to delete owner.lock and its containing directory.
+            os.close(self._owner_fd)
+            self._owner_fd = None
+            counts = self.counts()
+            if not any(counts.values()):
+                for path in self.path.iterdir():
+                    if path.is_dir():
+                        for child in path.iterdir():
+                            child.unlink()
+                        path.rmdir()
+                    else:
+                        path.unlink()
+                self.path.rmdir()
+                _sync_directory(self.root.path)

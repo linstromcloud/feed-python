@@ -277,13 +277,20 @@ If the server accepts a request but its response is lost, recovery can send it
 again with the same identity. Delivery is at least once; downstream identity
 deduplication handles those repeated attempts.
 
-Spools use private directories and files, immutable event files, atomic rename,
-and synced writes. They store destination metadata and an API-key fingerprint,
-never access tokens, refresh tokens, or API keys. A shared filesystem must
-provide working POSIX `flock`, atomic rename, and `fsync` semantics. The process
-and quota tests run on local POSIX storage; validate these semantics on the
-cluster's actual shared filesystem. Node-local temporary storage does not
-survive deletion of that storage.
+Feed supports Windows, macOS, and Linux. Spools use immutable event files,
+atomic replacement, and synced file writes. They store destination metadata
+and an API-key fingerprint, never access tokens, refresh tokens, or API keys.
+Process coordination uses Windows byte-range locks or POSIX `flock`. A shared
+filesystem must support these locks, atomic replacement, and file `fsync`;
+validate these semantics on the cluster's actual shared filesystem.
+
+POSIX writes also sync parent directories. Windows supports recovery after a
+process exits; directory changes are not explicitly synced, so recent creates,
+replacements, and deletions can be lost after an OS crash or power failure.
+Node-local temporary storage does not survive deletion of that storage.
+
+POSIX files and directories use owner-only permissions. Windows uses inherited
+filesystem ACLs; keep spool and credential paths in a user-private directory.
 
 Concurrent processes may use the same cached login. Refresh-token rotation is
 protected by a file lock. Set `FEED_CREDENTIALS_FILE` if each process needs a

@@ -21,11 +21,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
 import requests
 
 from .errors import AuthError
-
-try:
-    import fcntl
-except ImportError:  # pragma: no cover - process locking requires POSIX
-    fcntl = None  # type: ignore[assignment]
+from ._filesystem import lock, sync_directory
 
 _VERSION = 1
 _ACCESS_TOKEN_MARGIN_SECONDS = 60
@@ -65,15 +61,9 @@ class CredentialStore:
         lock_fd = os.open(self.lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
             os.chmod(self.lock_path, 0o600)
-            if fcntl is None:
-                raise AuthError(
-                    "shared credential locking requires a POSIX platform with fcntl"
-                )
-            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+            lock(lock_fd)
             yield
         finally:
-            if fcntl is not None:
-                fcntl.flock(lock_fd, fcntl.LOCK_UN)
             os.close(lock_fd)
 
     def load(self) -> Dict[str, Any]:
@@ -123,11 +113,7 @@ class CredentialStore:
             os.chmod(tmp, 0o600)
             os.replace(tmp, self.path)
             os.chmod(self.path, 0o600)
-            directory_fd = os.open(self.path.parent, os.O_RDONLY)
-            try:
-                os.fsync(directory_fd)
-            finally:
-                os.close(directory_fd)
+            sync_directory(self.path.parent)
         finally:
             try:
                 tmp.unlink()
