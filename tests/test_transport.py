@@ -22,6 +22,7 @@ def transport_response(status, body):
     response = Mock(status_code=status, headers={})
     response.json.return_value = body
     session.post.return_value = response
+    session.get.return_value = response
     transport.local.session = session
     return transport, session
 
@@ -61,3 +62,17 @@ def test_telemetry_does_not_follow_redirects():
     transport, session = transport_response(302, {})
     assert transport.upload("run", [EVENT]).kind == "retry"
     assert session.post.call_args.kwargs["allow_redirects"] is False
+
+
+@pytest.mark.parametrize(
+    "body", [None, [], {}, {"rules": None}, {"rules": {}}, {"rules": "bad"}]
+)
+def test_blacklist_without_rules_array_is_retried(body):
+    transport, _ = transport_response(200, body)
+    assert transport.blacklist().kind == "retry"
+
+
+def test_blacklist_with_rules_array_succeeds():
+    transport, _ = transport_response(200, {"rules": [{"schema_hash": "*"}]})
+    outcome = transport.blacklist()
+    assert outcome.kind == "success" and len(outcome.rules) == 1

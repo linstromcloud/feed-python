@@ -401,7 +401,9 @@ class RunSpool:
         checkpoints = manifest.setdefault("filtered", {})
         checkpoint = checkpoints.get(channel, {"ticket": -1, "count": 0})
         if "filtered_count" not in retry:
-            if blacklist.is_blacklisted(event["schema_hash"], event["data"]):
+            if blacklist.is_blacklisted(
+                event["schema_hash"], event["schema_def"], event["data"]
+            ):
                 retry["filtered_count"] = checkpoint["count"] + 1
             else:
                 retry["wire_seq"] = event["seq"] - checkpoint["count"]

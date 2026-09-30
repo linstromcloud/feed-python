@@ -36,6 +36,7 @@ def test_selecting_a_batch_does_not_read_backlog_files(tmp_path):
                 "seq": ticket,
                 "channel": "data",
                 "schema_hash": "metric",
+                "schema_def": {"step": "int64"},
                 "data": {"step": ticket},
             }
             payload = json.dumps(event).encode()

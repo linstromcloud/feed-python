@@ -69,9 +69,10 @@ class Transport:
                 allow_redirects=False,
             )
             if response.status_code == 200:
-                return Outcome(
-                    "success", rules=parse_rules(response.json().get("rules"))
-                )
+                body = response.json()
+                if not isinstance(body, dict) or not isinstance(body.get("rules"), list):
+                    return Outcome("retry", "invalid blacklist response")
+                return Outcome("success", rules=parse_rules(body["rules"]))
             return self._failure(response)
         except Exception as exc:
             return Outcome("retry", str(exc))
@@ -119,7 +120,9 @@ class Transport:
                 filtered = {
                     event["ticket"]
                     for event in events
-                    if policy.is_blacklisted(event["schema_hash"], event["data"])
+                    if policy.is_blacklisted(
+                        event["schema_hash"], event["schema_def"], event["data"]
+                    )
                 }
                 if len(filtered) != dropped:
                     return Outcome("retry", "inconsistent filtering acknowledgement")

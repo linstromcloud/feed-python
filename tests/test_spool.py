@@ -106,6 +106,7 @@ def test_checkpoint_keeps_filter_compaction_and_retry_identity(tmp_path):
             "seq": ticket,
             "channel": "data",
             "schema_hash": schema,
+            "schema_def": {},
             "data": {},
         }
         payload = json.dumps(event).encode()

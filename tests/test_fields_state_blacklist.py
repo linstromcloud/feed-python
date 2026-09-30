@@ -199,29 +199,31 @@ def test_merge_event_shadows_state_case_insensitively():
 def test_hash_only_rule():
     bl = Blacklist()
     bl.set_rules(parse_rules([{"schema_hash": "abc"}]))
-    assert bl.is_blacklisted("abc", {"x": 1})
-    assert not bl.is_blacklisted("def", {"x": 1})
+    assert bl.is_blacklisted("abc", {"x": "int64"}, {"x": 1})
+    assert not bl.is_blacklisted("def", {"x": "int64"}, {"x": 1})
 
 
-def test_match_filter_stringified():
+def test_match_filter_by_declared_type():
+    schema = {"event_type": "string", "damage": "float64"}
     bl = Blacklist()
     bl.set_rules(
         parse_rules(
-            [{"schema_hash": "abc", "match": {"event_type": "shoot", "damage": "12.5"}}]
+            [{"schema_hash": "abc", "match": {"event_type": "shoot", "damage": "12"}}]
         )
     )
-    assert bl.is_blacklisted("abc", {"event_type": "shoot", "damage": 12.5})
-    assert not bl.is_blacklisted("abc", {"event_type": "shoot", "damage": 13.0})
-    assert not bl.is_blacklisted("abc", {"event_type": "shoot"})  # missing field
+    assert bl.is_blacklisted("abc", schema, {"event_type": "shoot", "damage": 12.0})
+    assert not bl.is_blacklisted("abc", schema, {"event_type": "shoot", "damage": 12.5})
+    assert not bl.is_blacklisted("abc", schema, {"event_type": "shoot"})
 
 
 def test_wildcard():
+    schema = {"build_version": "string"}
     bl = Blacklist()
     bl.set_rules(
         parse_rules([{"schema_hash": "*", "match": {"build_version": "1.4.2"}}])
     )
-    assert bl.is_blacklisted("anything", {"build_version": "1.4.2"})
-    assert not bl.is_blacklisted("anything", {"build_version": "1.5.0"})
+    assert bl.is_blacklisted("anything", schema, {"build_version": "1.4.2"})
+    assert not bl.is_blacklisted("anything", schema, {"build_version": "1.5.0"})
 
 
 def test_merge_dedups():
@@ -229,6 +231,34 @@ def test_merge_dedups():
     bl.set_rules(parse_rules([{"schema_hash": "abc"}]))
     bl.merge_rules(parse_rules([{"schema_hash": "abc"}, {"schema_hash": "xyz"}]))
     assert len(bl) == 2
+
+
+def test_merge_dedups_by_match_names_and_values():
+    bl = Blacklist()
+    bl.set_rules(parse_rules([{"schema_hash": "abc", "match": {"a=b": "c"}}]))
+    bl.merge_rules(
+        parse_rules(
+            [
+                {"schema_hash": "abc", "match": {"a": "b=c"}},
+                {"schema_hash": "abc", "match": {"p": {"z": "0"}}},
+                {"schema_hash": "abc", "match": {"p": {"z": "0"}}},
+            ]
+        )
+    )
+    assert len(bl) == 3
+
+
+def test_rule_with_unsupported_match_value_is_left_out():
+    rules = parse_rules(
+        [
+            {"schema_hash": "abc", "match": {"a": None}},
+            {"schema_hash": "abc", "match": {"a": {"b": None}}},
+            {"schema_hash": "abc", "match": {"a": ["x"]}},
+            {"schema_hash": "abc", "match": {"a": 1}},
+            {"schema_hash": "abc", "match": {"a": "1"}},
+        ]
+    )
+    assert len(rules) == 1
 
 
 # --- protocol -------------------------------------------------------------
