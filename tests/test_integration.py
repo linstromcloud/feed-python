@@ -4,7 +4,6 @@ Exercises the full worker path: blacklist fetch, emit -> merge -> hash -> batch
 -> gzip -> upload, response parsing, blacklist filtering, and shutdown flush.
 """
 
-
 import pytest
 
 from feed import init
@@ -12,11 +11,37 @@ from feed.client import Client
 from feed.config import ChannelSettings, Config
 from feed.fields import EventBuilder
 from feed.schema import compute_schema_hash
+from feed.sync import status
 
 
 def _all_events(server):
     with server.lock:
         return [ev for batch in server.received for ev in batch["events"]]
+
+
+def test_unexplained_server_drop_drains_spool_and_merges_rules(mock_server, caplog):
+    url, server = mock_server
+    server.upload_response = {
+        "ingested": 0,
+        "dropped": 1,
+        "blacklisted": [{"schema_hash": "*", "match": {"kind": "future"}}],
+    }
+    with init(ingest_url=f"{url}/v1/training", api_key="secret") as client:
+        assert client.log("events", {"kind": "server-only"})
+        report = client.flush(2)
+        assert report.successful
+        assert report.delivered == 1
+        assert report.filtered == report.pending == 0
+        assert status()["pending"] == 0
+
+        assert client.log("events", {"kind": "future"})
+        report = client.flush(2)
+        assert report.successful
+        assert report.filtered == 1
+        assert report.delivered == 0
+
+    assert len(server.attempts) == 1
+    assert "unexplained server drops=1" in caplog.text
 
 
 def test_emits_and_uploads_batch(mock_server):
@@ -239,9 +264,14 @@ def test_run_logs_map_names_and_record_shapes_to_wire_schemas(mock_server):
         "research-project",
         server_url=url,
         api_key="secret",
-        name="baseline",
-        config={"Model": {"Width": 64, "Dropout": 0.1}},
-        tags=["paper"],
+    )
+    assert run.emit(
+        "runs",
+        EventBuilder()
+        .add_string("name", "baseline")
+        .add_variant("config", {"Model": {"Width": 64, "Dropout": 0.1}})
+        .add_string_array("tags", ["paper"])
+        .build(),
     )
     assert run.log("train", {"step": 10, "loss": 1.0})
     assert run.log("train", {"step": 10, "accuracy": 0.25})
@@ -271,7 +301,7 @@ def test_run_logs_map_names_and_record_shapes_to_wire_schemas(mock_server):
     ]
     assert len(train_events) == 4
     assert {event["data"]["step"] for event in train_events} == {10, 3, 4}
-    assert {event["channel"] for event in train_events} == {"data"}
+    assert {event["channel"] for event in train_events} == {"default"}
     assert len({event["schema_hash"] for event in train_events}) == 2
     assert {
         frozenset(schemas[event["schema_hash"]].keys()) for event in train_events
@@ -290,7 +320,7 @@ def test_run_logs_map_names_and_record_shapes_to_wire_schemas(mock_server):
     run_event = next(
         event
         for event in events
-        if schemas[event["schema_hash"]]["$schema_name"] == "run"
+        if schemas[event["schema_hash"]]["$schema_name"] == "runs"
     )
     assert run_event["data"]["config"] == {"Model": {"Width": 64, "Dropout": 0.1}}
     assert schemas[run_event["schema_hash"]]["config"] == "variant"

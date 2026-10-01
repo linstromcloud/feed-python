@@ -2,8 +2,7 @@
 
 The Feed type system is ``bool``, ``int64``, ``float64``, ``string``,
 ``variant``, plus a homogeneous array and an optional (nullable) form of each
-scalar. Each field knows both its *type descriptor* (used to build the schema
-that gets hashed) and its *data value* (the actual payload).
+scalar. Each field exposes its type descriptor and JSON value.
 
 Python's ``int``/``float`` distinction maps cleanly to ``int64``/``float64``;
 ``bool`` is checked before ``int`` since ``bool`` is a subclass of ``int``.
@@ -108,7 +107,7 @@ class Field:
 
 
 class EventBuilder:
-    """Internal builder for one record's typed fields.
+    """Builder for one record's typed fields.
 
     >>> fields = (
     ...     EventBuilder()

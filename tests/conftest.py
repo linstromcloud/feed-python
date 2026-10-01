@@ -73,7 +73,10 @@ class _Handler(BaseHTTPRequestHandler):
                 self.connection.close()
                 return
             n = len(batch.get("events", []))
-            self._respond(200, json.dumps({"ingested": n, "dropped": 0}).encode())
+            body = self.server.upload_response
+            if body is None:
+                body = {"ingested": n, "dropped": 0}
+            self._respond(200, json.dumps(body).encode())
         else:
             self._respond(404, b"{}")
 
@@ -87,6 +90,7 @@ def mock_server():
     server.blacklist_rules = []
     server.auth_headers = []
     server.max_events_per_request = None
+    server.upload_response = None
     server.available = True
     server.responder = None
     server.request_paths = []

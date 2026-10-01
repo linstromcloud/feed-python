@@ -121,8 +121,16 @@ class Transport:
                     for event in events
                     if policy.is_blacklisted(event["schema_hash"], event["data"])
                 }
-                if len(filtered) != dropped:
-                    return Outcome("retry", "inconsistent filtering acknowledgement")
+                matched = len(filtered)
+                if matched != dropped:
+                    if matched > dropped:
+                        filtered.clear()
+                    logger.warning(
+                        "feed: unexplained server drops=%d (dropped=%d, rule_matches=%d)",
+                        dropped - len(filtered),
+                        dropped,
+                        matched,
+                    )
                 return Outcome("success", rules=rules, filtered=filtered)
             if response.status_code == 413:
                 return Outcome("large", "HTTP 413")

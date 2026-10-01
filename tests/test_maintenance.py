@@ -166,16 +166,17 @@ def test_full_spool_keeps_memory_bounded_and_reports_unsaved(mock_server):
     )
     try:
         assert run.log({"step": 0})
-        until(lambda: run._client._worker._spool.counts()["pending"] == 2)
+        assert run.log({"step": 1})
+        until(lambda: run._worker._spool.counts()["pending"] == 2)
         accepted = 0
         while accepted < 100 and run.log({"blob": "x" * 500}):
             accepted += 1
         assert 0 < accepted < 100
-        assert run._client._admission.used <= 4096
+        assert run._admission.used <= 4096
         report = run.finish(0.1)
         assert report.persisted_pending == 2
         assert report.unsaved == accepted
-        assert run._client._worker._spool.root.usage() <= 96 * 1024
+        assert run._worker._spool.root.usage() <= 96 * 1024
     finally:
         run.finish(1)
 
@@ -202,7 +203,7 @@ def test_quota_pressure_preserves_filtering_sequence_order(mock_server):
         report = run.flush(0.1)
         assert report.unsaved == 2
         assert report.filtered == 0
-        SpoolRoot(run._client._worker._spool.root.path, 512 * 1024)
+        SpoolRoot(run._worker._spool.root.path, 512 * 1024)
         report = run.flush(5)
         assert report.successful
         assert report.delivered == report.filtered == 1

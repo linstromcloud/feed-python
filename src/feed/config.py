@@ -54,7 +54,7 @@ class ChannelSettings:
 
 @dataclass
 class Config:
-    """Internal transport configuration assembled by :func:`feed.init`."""
+    """Endpoint, channels, and delivery settings for :class:`feed.Client`."""
 
     #: Feed ingest origin discovered from the selected feed.
     server_url: str
@@ -69,16 +69,15 @@ class Config:
     channels: List[ChannelSettings] = field(default_factory=list)
     #: Client-wide cap on concurrently in-flight uploads.
     max_concurrent_requests: int = Defaults.MAX_CONCURRENT_REQUESTS
-    #: Legacy option. Filtering rules retry while local persistence continues.
+    #: Does not limit filtering-rule fetch attempts.
     max_blacklist_fetch_attempts: int = Defaults.MAX_BLACKLIST_FETCH_ATTEMPTS
     #: Initial retry backoff (seconds).
     retry_base_delay_seconds: float = Defaults.RETRY_BASE_DELAY_SECONDS
     #: Maximum retry backoff (seconds).
     retry_max_delay_seconds: float = Defaults.RETRY_MAX_DELAY_SECONDS
-    #: Legacy option, retained for source compatibility. Durable retries do not
-    #: discard records after an attempt count.
+    #: Does not limit upload retry attempts.
     max_retries: int = Defaults.MAX_RETRIES
-    #: Legacy option. The spool quota and upload slots now bound retries.
+    #: Retry capacity follows the spool quota and upload-slot limits.
     max_retry_queue_depth: int = Defaults.MAX_RETRY_QUEUE_DEPTH
     #: Blacklist-fetch request timeout (seconds).
     blacklist_timeout_seconds: float = Defaults.BLACKLIST_TIMEOUT_SECONDS

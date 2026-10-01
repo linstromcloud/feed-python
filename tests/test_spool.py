@@ -255,3 +255,63 @@ os._exit(0)
             if child.poll() is None:
                 child.kill()
                 child.wait()
+
+
+def test_empty_spool_closes_owner_before_unlink(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+
+    root = SpoolRoot(tmp_path)
+    spool = root.create(DESTINATION, "empty-run", 65536)
+    owner_fd = spool._owner_fd
+    unlink = Path.unlink
+
+    def check_owner_closed(path, *args, **kwargs):
+        if path == spool.path / "owner.lock":
+            with pytest.raises(OSError):
+                os.fstat(owner_fd)
+        return unlink(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", check_owner_closed)
+    spool.close()
+    spool.close()
+    assert not spool.path.exists()
+
+
+def test_live_owner_is_exclusive_across_processes_and_released_on_exit(tmp_path):
+    import subprocess
+    import sys
+
+    script = """
+import os, sys
+from feed.spool import SpoolRoot
+root = SpoolRoot(sys.argv[1])
+spool = root.create({}, "child", 65536)
+spool.persist(0, b'{"ticket":0}')
+print("ready", flush=True)
+sys.stdin.readline()
+os._exit(0)
+"""
+    child = subprocess.Popen(
+        [sys.executable, "-c", script, str(tmp_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert child.stdout.readline().strip() == "ready"
+        root = SpoolRoot(tmp_path)
+        assert root.claim(tmp_path / "child") is None
+        _, error = child.communicate("exit\n", timeout=10)
+        assert child.returncode == 0, error
+        recovered = root.claim(tmp_path / "child")
+        assert recovered is not None
+        assert recovered.read(0) == {"ticket": 0}
+        recovered.ack(0)
+        recovered.close()
+        assert list(root.runs()) == []
+    finally:
+        if child.poll() is None:
+            child.kill()
+            child.wait()

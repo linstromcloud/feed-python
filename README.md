@@ -1,297 +1,195 @@
 # Feed for Python
 
-Log measurements and structured events from Python. A feed is a shared logging
-destination inside a project. Feed handles authentication, batching, retries,
-and delivery in a background thread; application code stays synchronous.
+Feed telemetry client for Python 3.9 and newer. Supports Windows, macOS, and Linux.
 
-## Get started
+## How your calls become tables
 
-```sh
-uv add "feed @ git+https://github.com/linstromcloud/feed-python.git"
-```
+- Feed stores events as rows, grouped by stream name and schema.
+- The name passed to `emit` or `log` identifies the stream and becomes its logical table name. Event fields, current state fields, and system fields become columns.
+- `schema_hash` hashes the stream name and the names and wire types of its event and state fields.
 
-Sign in to an Analyze deployment and list the feeds you can use:
+`set_state` and `remove_state` write and remove fields attached to every event until overwritten or removed.
 
-```sh
-uv run feed login https://analyze.example.com
-uv run feed list
-```
+Supported types: `bool`, `int64`, `float64`, `string`, homogeneous arrays, structs, and nullable scalars.
 
-`feed login` prints a browser URL and asks for a one-time code. On a cluster,
-open the URL on any machine and paste the code into the login-node terminal.
-Your credentials are saved under `~/.config/feed/` and safely shared by jobs
-using the same home directory.
-
-`feed list` prints copyable `project/feed` references and their current status.
-If one feed is available, login selects it automatically. Otherwise, choose a
-default once:
+## Installation
 
 ```sh
-uv run feed use "Diffusion study/training"
+uv add "feed-python @ git+https://github.com/linstromcloud/feed-python.git"
 ```
 
-Create feeds in the Analyze project UI. Every project member with logging
-permission sees the same feeds after running `feed list`.
+Or with pip:
 
-Then log a run without repeating the selected feed:
+```sh
+python -m pip install "feed-python @ git+https://github.com/linstromcloud/feed-python.git"
+```
+
+## API usage
+
+A feed is a logging destination inside a project. `feed.init()` starts a `Client` that owns state, channels, and background delivery. The context manager calls `finish()` on exit.
 
 ```python
 import feed
 
 with feed.init(
-    name="width-256-seed-7",
-    config={"width": 256, "seed": 7, "optimizer": {"lr": 3e-4}},
-    tags=["ablation"],
-) as run:
-    for step in range(1_000):
-        run.log("train", {
-            "step": step,
-            "loss": loss,
-            "accuracy": accuracy,
-        })
-
-    run.log("validation", {
-        "step": 999,
-        "loss": validation_loss,
-        "accuracy": validation_accuracy,
-    })
+    ingest_url="https://ingest.example.com/v1/sensors",
+    api_key="your-api-key",
+) as client:
+    client.set_state("sensor", "room_1")
+    client.log("readings", {"temperature": 21.4, "humidity": 0.6})
 ```
 
-The context manager flushes before the process exits. `run.id` is the UUID that
-links every row produced by that run.
-
-Pass the reference directly to override the saved default for one process:
+Use the explicit `emit` form for more control over field types, including nullable fields:
 
 ```python
-with feed.init("Diffusion study/evaluation", name="held-out") as run:
-    run.log("metrics", {"dataset": "test", "accuracy": 0.94})
+import feed
+
+with feed.init(
+    ingest_url="https://ingest.example.com/v1/sensors",
+    api_key="your-api-key",
+) as client:
+    client.set_state("sensor", "room_1")
+    fields = (
+        feed.EventBuilder()
+        .add_float("temperature", 21.4)
+        .add_optional_float("humidity", 0.6)
+        .build()
+    )
+    client.emit("readings", fields)
 ```
 
-The `FEED` environment variable provides the same override. If several feeds
-are available and no default is selected, `feed.init()` lists the choices
-instead of guessing a destination.
+`ingest_url` identifies the feed. Environment defaults are `FEED_INGEST_URL` and `FEED_API_KEY`.
 
-For a complete UV environment and runnable example, see
-[`examples/uv`](examples/uv/README.md).
+For direct endpoint configuration, use `feed.Client(feed.Config(...))`. See [configuration fields](src/feed/config.py), the [typed example](examples/basic.py), and the [UV example](examples/uv/README.md).
 
-## The run API
+`EventBuilder.add` infers types. Typed methods include `add_bool`, `add_int`, `add_float`, `add_string`, their `add_*_array` forms, and `add_optional_*` scalar forms. `build()` returns the fields and clears the builder.
 
-The high-level API has four concepts:
+## Interactive login
 
-- **Project** — the authorization boundary that contains one or more feeds.
-- **Feed** — a shared logging destination selected as `project/feed`.
-- **Run** — one process or logical unit of work, with optional name, config,
-  tags, and group.
-- **Stream name** — a named collection whose name becomes its logical query
-  table.
-- **Record** — one native typed row appended with `log`.
+Sign in, list the feeds your account can use, and select a default:
 
-Feed assigns no special meaning to fields such as `step`, and never increments
-them implicitly. Put whatever coordinates and values belong to one observation
-in the record:
-
-```python
-run.log("benchmark", {"iteration": 20, "throughput": 412.8})
-
-run.log("simulation", {
-    "replicate": 3,
-    "elapsed_seconds": 0.0,
-    "temperature": 21.4,
-    "pressure": 100.8,
-})
+```sh
+feed login https://api.example.com
+feed list
+feed use "Your project/telemetry"
 ```
 
-The default stream is `log`:
+With UV, prefix these commands with `uv run`. Create feeds in the project UI.
+
+Login prints a browser URL and asks for a one-time code. Credentials are saved under `~/.config/feed/` and shared by processes using the same home directory.
+
+Call `feed.init()` to use the selected feed and saved credentials. Pass `feed.init("Your project/another_feed")` or set `FEED` to select another feed.
+
+## What goes in state vs. events
+
+A field goes in `set_state` if both:
+
+- You use it to filter or group events when querying the data.
+- It applies to every event while that state is set.
+
+Everything else goes in `emit`.
+
+Common state values: `device_id`, `build_version`, `platform`, `region`, and `environment`.
+
+Each event captures the current state snapshot. `set_state` infers typed structs for dictionaries and typed arrays for lists and tuples. Explicit setters include `set_state_float`, `set_state_string_array`, and `set_state_optional_int`. Use `has_state` to inspect a field and `remove_state` to remove it.
+
+## Repeated values compress well
+
+Parquet stores values by column and can encode repeated values with dictionaries and run lengths. Fields that stay constant across many events, such as `device_id` and `build_version`, take little additional space per row.
+
+## Things to avoid
+
+- **Avoid reusing field names between events and state.** Event fields override state fields with the same name.
+- **Use ASCII letters, digits, and underscores for stream and field names.** Names are lowercased.
+- **Avoid [system column](#system-columns) names.** Colliding user fields are exposed with a `data__` prefix.
+- **Give standalone nulls and empty arrays explicit types.** Use `add_optional_float("value", None)` or `add_string_array("labels", [])`. Typed integer fields use signed 64-bit values; floats must be finite.
+
+## Lifecycle and health
+
+- `is_running`: ingestion is enabled and the worker has not finished.
+- `worker_state`: `INITIALIZING`, `FETCHING_BLACKLIST`, `RUNNING`, or `FINISHED`.
+- `emit` and `log` return `True` when an event enters the memory queue. Disabled or stopped clients, invalid channel handles, full queues, rate limits, and oversized events return `False`. Invalid names and values raise exceptions.
+- `emit_wait` and `log_wait` wait for queue capacity up to the supplied timeout.
+- `flush(timeout=10)` waits for accepted events. `finish(timeout=10)` also stops admission and shuts down the worker.
+
+The worker saves events to disk before uploading. A crash can lose events still in memory. Check the delivery report when delivery matters:
 
 ```python
-run.log({"elapsed_seconds": 10.0, "objective": 0.42})
-```
-
-Pass a stream name when the record belongs to a named collection:
-
-```python
-run.log("validation", {"step": 999, "loss": 0.41})
-```
-
-Records can contain nested values without switching APIs:
-
-```python
-run.log(
-    "attention_diagnostics",
-    {
-        "layer": 8,
-        "matrix": [[0.1, 0.2], [0.3, 0.4]],
-        "summary": {"mean": 0.25, "labels": ["a", "b"]},
-    },
-)
-```
-
-The first argument becomes the wire schema name and, ultimately, the logical
-table name. Feed supports booleans, integers, floats, strings, homogeneous
-arrays, nested dictionaries, and homogeneous nested lists. Run configuration
-uses Feed's dynamic `variant` type, so different runs may use different nested
-config shapes without splitting the run schema.
-
-Names are case-insensitive and must contain only ASCII letters, digits, and
-underscores. Integers must fit in signed 64 bits, floats must be finite, and
-arrays must contain one consistent type. Feed rejects ambiguous values such as
-`None` and empty arrays because their wire type cannot be inferred. Convert
-library-specific scalar objects, such as NumPy or PyTorch scalars, to ordinary
-Python values (for example with `.item()`) before logging them.
-
-To turn logging off without changing application control flow, pass
-`enabled=False`. This needs no login or endpoint, starts no background thread,
-and makes `log()` and `log_wait()` return `False` without inspecting the record.
-`flush()` and `finish()` return a successful empty delivery report.
-
-## Delivery behavior
-
-`log` builds the event, checks its complete schema and data against the size
-limit, then encodes and admits it to memory without disk or HTTP I/O. `True`
-means memory admission. The background worker persists records
-before uploading them. Persistence runs when queued bytes reach 256 KiB or the
-one-second interval expires; channel event thresholds and explicit flushes can
-also trigger it. Network failures, authentication failures, and unavailable
-filtering rules do not stop local persistence.
-
-A crash can lose records still awaiting persistence. The interval is a target,
-not a maximum loss window: slow or failed storage can extend it. The context
-manager calls `finish()` to save queued records and wait for delivery before
-the process exits:
-
-```python
-report = run.finish(timeout=30)
+report = client.finish(timeout=30)
 if not report.successful:
     raise RuntimeError(
-        f"delivery incomplete: persisted={report.persisted_pending}, "
+        f"pending={report.persisted_pending}, "
         f"unsaved={report.unsaved}, failed={report.failed}"
     )
 ```
 
-For producers that must apply backpressure, use `log_wait`, then inspect
-`flush()` before advancing the source cursor:
+A successful report means every covered record was acknowledged or explicitly filtered. Lake ingestion happens downstream. See [delivery and recovery](docs/delivery.md) for limits, persistence, retries, and `feed status` / `feed sync`.
+
+`feed.init(enabled=False)` needs no credentials and returns a client whose emit and log methods return `False`.
+
+## Schema evolution and the hash
+
+Adding or removing an event or state field, or changing its type, creates a new schema hash. Changing field values keeps the same hash.
+
+The sink controls how versions appear in queries: separate schema views or union views of compatible schemas. Incompatible types use separate generations.
+
+## System columns
+
+Every row also gets system fields:
+
+- `session_id`: UUID identifying the client instance.
+- `session_sequence_num`: sequence number within the session and channel.
+- `channel`: the channel used for emission.
+- `schema_name`: the stream name passed to `emit` or `log`.
+- `feed_id`: endpoint identifier in query views; exported data uses `game_id`.
+- `server_timestamp`: when the server accepted the event.
+
+## Channels (advanced)
+
+Each channel has its own queue, sequence numbers, rate limit, and upload priority. Channels share the client's memory budget and spool quota. Lower numeric priorities upload first when capacity is contended.
 
 ```python
-accepted = run.log_wait("export", {"records": 500}, timeout=30)
-report = run.flush(timeout=30)
-if not accepted or not report.successful:
-    raise RuntimeError("Feed delivery is incomplete")
+with feed.init(channels=[feed.ChannelSettings("alerts", priority=-1)]) as client:
+    alerts = client.channel("alerts")
+    fields = feed.EventBuilder().add_string("message", "hot").build()
+    client.emit_on(alerts, "alarm", fields)
 ```
 
-The defaults bound encoded queue data to 16 MiB per run and each encoded event,
-including its schema, to 4 MiB. Oversized events return `False` with a warning;
-`log_wait` rejects a completed event that cannot fit without waiting for queue
-capacity. Queued records and records awaiting persistence share the memory
-budget. Size is checked once after construction; type validation and event
-construction can allocate memory before that check. Upload encoding/compression
-and the spool's filename index require additional working memory. These limits
-do not establish an OS process-memory limit.
+`emit` and `log` use `default`. Channel lookup is case-insensitive; unknown names resolve to `default`.
 
-The shared spool defaults to 1 GiB at `~/.local/state/feed/spool/`, or under
-`XDG_STATE_HOME` when set. `FEED_SPOOL_DIR` overrides its location. The quota
-includes conservative file/metadata charges and outstanding reservations across
-all runs and projects. The worker reserves space for its pending writes and
-releases unused credit. Idle runs reserve only their bookkeeping space (32 KiB
-per run), with no event allowance. A full spool leaves accepted records in the
-bounded memory queue; further calls return `False` when that queue fills.
-`log_wait` waits for queue space, and `finish` reports any remaining `unsaved`
-records. Persistence preserves channel order. Existing records are never evicted
-to admit new ones.
+## Dictionary logging (optional)
 
-Configure these limits when starting a run:
+`log` infers fields from a dictionary. Each top-level key becomes a separate column. Dictionary-valued fields become typed structs; arrays keep their inferred types.
 
 ```python
-run = feed.init(
-    max_spool_bytes=1024**3,
-    memory_queue_bytes=32 * 1024**2,
-    max_event_bytes=8 * 1024**2,
-    persist_interval_seconds=1.0,
-    persist_threshold_bytes=256 * 1024,
-)
+client.log("readings", {"temperature": 21.4, "details": {"unit": "celsius"}})
+client.log({"healthy": True})  # Uses the stream named "log".
 ```
 
-The event limit must be at most half the queue byte budget and at most 64 MiB.
-An explicit `max_spool_bytes` updates the shared directory's budget under its
-quota lock; it cannot lower the budget below stored and reserved usage. Omit it
-to use the existing budget, or the 1 GiB default for a new directory.
+### Example: joining two tables
 
-Transient failures retry with capped, jittered backoff and honor `Retry-After`.
-Waiting batches retain ticket lists in memory; their payloads stay on disk.
-Retry timing resets after restart. Upload workers reuse their HTTP sessions.
-The legacy `max_retries`, `max_retry_queue_depth`, and
-`max_blacklist_fetch_attempts` options remain accepted; they no longer discard
-durable records or disable recording. Channel priorities, rate limits, queue
-counts, upload thresholds, and per-channel/global upload slots still apply.
-The run API gives metadata priority over data. Priority selects waiting uploads;
-it cannot preempt an in-flight HTTP request.
+In this example, the application chooses two tables: `sessions` for configuration and `readings` for measurements.
 
-An HTTP 413 splits a batch. An individually oversized or permanently rejected
-upload remains in a `.failed` file with its error. Later eligible metrics can
-upload while that record is failed, delayed, or in flight. Overall capacity
-still bounds admission during an outage.
-
-`flush()` waits for the records admitted before its call. `finish()` closes
-admission, prioritizes persistence, and waits for uploads within its deadline.
-If disk writes cannot finish within that time, `unsaved` reports the remaining
-memory records. A stalled filesystem call may continue in the daemon worker.
-Reports distinguish `delivered`, `filtered`, `failed`, `persisted_pending`, and
-`unsaved`; `pending` includes both persisted and unsaved records. `dropped` is
-the legacy name for `failed`. A successful report requires remote
-acknowledgement or explicit filtering for every covered record. It does not
-mean the data has reached the lake. Recovered runs are separate from a new
-run's delivery report.
-
-### Recover saved records
-
-While a run is active, delivery resumes when the endpoint becomes available.
-A new `feed.init()` also recovers inactive spools for its selected deployment,
-project, and feed. Cached member credentials supply stable IDs. API-key runs
-match the original URL, feed reference, endpoint, and key fingerprint. Other
-projects remain untouched.
-
-After a job exits, inspect and synchronize every saved destination:
-
-```sh
-feed status
-feed sync
-feed sync --timeout 10 --json
+```python
+with feed.init() as client:
+    client.log("sessions", {
+        "config": {
+            "sample_interval_seconds": 1.0,
+            "thresholds": {"temperature": 25.0},
+        },
+    })
+    for sample, temperature in enumerate((21.0, 21.2, 21.1)):
+        client.log("readings", {"sample": sample, "temperature": temperature})
 ```
 
-`feed sync` resolves each destination using the current login or the matching
-`FEED_API_KEY`. It attempts each outstanding record once, including previously
-failed records, and splits oversized batches. Unavailable destinations retain
-their records while the command continues with other runs. The timeout applies
-to each HTTP request, not the complete pass. A subsequent invocation can retry
-remaining work. An empty or fully delivered pass exits zero; pending records,
-failed records, active owners, and errors produce a nonzero exit status.
+Join the records on their shared `session_id` in downstream analysis.
 
-An active run keeps exclusive ownership. Sync requests a flush from its worker
-and reports the run as active; it does not start a competing uploader. Both
-commands accept `--spool-dir` and `--json`. Status describes files already on
-disk; unpersisted memory records remain visible through the producing run's
-delivery report.
+## Blacklisting (advanced)
 
-Recovery preserves session IDs, channel sequences, captured data, and schemas.
-Uploads require a valid ingestion acknowledgement before deleting saved records.
-If the server accepts a request but its response is lost, recovery can send it
-again with the same identity. Delivery is at least once; downstream identity
-deduplication handles those repeated attempts.
+Server-provided blacklist rules filter events before upload. A rule selects a `schema_hash` or `"*"` for all schemas; its optional `match` object requires matching field values on the event, including attached state.
 
-Spools use private directories and files, immutable event files, atomic rename,
-and synced writes. They store destination metadata and an API-key fingerprint,
-never access tokens, refresh tokens, or API keys. A shared filesystem must
-provide working POSIX `flock`, atomic rename, and `fsync` semantics. The process
-and quota tests run on local POSIX storage; validate these semantics on the
-cluster's actual shared filesystem. Node-local temporary storage does not
-survive deletion of that storage.
-
-Concurrent processes may use the same cached login. Refresh-token rotation is
-protected by a file lock. Set `FEED_CREDENTIALS_FILE` if each process needs a
-different credential location.
-
-Schema and field names are lowercased. Changing an event's columns or their
-types creates a new physical schema version.
+The worker fetches rules before uploading and retries indefinitely if the fetch fails. Accepted events continue to persist locally. Matching events count as `filtered` in delivery reports.
 
 ## License
 
-MIT. See [`LICENSE`](LICENSE).
+MIT. See [LICENSE](LICENSE).

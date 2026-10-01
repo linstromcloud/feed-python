@@ -1,40 +1,25 @@
-"""Low-friction run interface built on the generic Feed client."""
+"""Initialize a Feed client using a saved login or an API key."""
 
 from __future__ import annotations
 
 import os
-import logging
-from dataclasses import dataclass, field
-from typing import Any, Iterable, Mapping, Optional, Union, overload
+from typing import Iterable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from .client import Client
 from .config import ChannelSettings, Config
 from .credentials import authenticated_feed
-from .delivery import DeliveryReport
-from .fields import EventBuilder
 
-_STANDARD_CHANNELS = (
-    ChannelSettings(
-        "metadata", priority=-2, flush_threshold_events=1, flush_interval_seconds=0.1
-    ),
-    ChannelSettings(
-        "data",
-        priority=0,
-        flush_threshold_events=128,
-        flush_interval_seconds=1.0,
-    ),
-)
+Run = Client
 
 
 def init(
     feed: Optional[str] = None,
     *,
+    ingest_url: Optional[str] = None,
     server_url: Optional[str] = None,
     api_key: Optional[str] = None,
-    name: Optional[str] = None,
-    config: Optional[Mapping[str, Any]] = None,
-    tags: Optional[Iterable[str]] = None,
-    group: Optional[str] = None,
+    channels: Optional[Iterable[ChannelSettings]] = None,
     enabled: bool = True,
     max_retries: Optional[int] = None,
     max_retry_queue_depth: Optional[int] = None,
@@ -44,13 +29,17 @@ def init(
     max_event_bytes: int = 4 * 1024**2,
     persist_interval_seconds: float = 1.0,
     persist_threshold_bytes: int = 256 * 1024,
-) -> "Run":
-    """Start a run in a shared feed.
+) -> Client:
+    """Start a Feed client with background delivery.
 
-    ``feed`` is the ``project/feed`` reference printed by ``feed list``. It
-    defaults to FEED, the feed selected by ``feed use``, or the sole feed
-    available at login. Credentials default to FEED_API_KEY and the service
-    URL to FEED_URL.
+    API-key access uses ``ingest_url`` (``https://host/v1/feed``) and
+    ``api_key``, defaulting to FEED_INGEST_URL and FEED_API_KEY. A URL ending
+    in ``/telemetry`` is also accepted. ``ingest_url`` cannot be combined
+    with explicit ``feed`` or ``server_url`` arguments.
+
+    Saved login uses ``feed``, the ``project/feed`` reference printed by
+    ``feed list``. It defaults to FEED, the selected feed, or the sole feed
+    available at login. ``server_url`` defaults to FEED_URL.
     """
     secret = api_key if api_key is not None else os.environ.get("FEED_API_KEY")
     token_provider = None
@@ -58,7 +47,19 @@ def init(
     resolved_feed = requested_feed
     feed_reference = requested_feed
     url = server_url or os.environ.get("FEED_URL") or ""
-    if secret is None and enabled:
+    ingest_url = (
+        ingest_url if ingest_url is not None else os.environ.get("FEED_INGEST_URL")
+    )
+    if ingest_url is not None and enabled:
+        if feed is not None or server_url is not None:
+            raise ValueError("ingest_url cannot be combined with feed or server_url")
+        if not secret:
+            raise ValueError(
+                "api_key is required with ingest_url (or set FEED_API_KEY)"
+            )
+        url, resolved_feed = _ingest_destination(ingest_url)
+        feed_reference = resolved_feed
+    elif secret is None and enabled:
         url, resolved_feed, token_provider, feed_reference = authenticated_feed(
             requested_feed or None, url
         )
@@ -75,7 +76,7 @@ def init(
         endpoint_id=resolved_feed,
         client_secret=secret,
         bearer_token_provider=token_provider,
-        channels=list(_STANDARD_CHANNELS),
+        channels=list(channels) if channels is not None else [],
         enabled=enabled,
         spool_dir=spool_dir,
         max_spool_bytes=max_spool_bytes,
@@ -92,142 +93,31 @@ def init(
         client_config.max_retries = max_retries
     if max_retry_queue_depth is not None:
         client_config.max_retry_queue_depth = max_retry_queue_depth
-    client = Client(client_config)
-    run = Run(_client=client, feed=feed_reference)
-    if enabled:
-        run._emit_run_metadata(
-            name=name, config=config or {}, tags=list(tags or ()), group=group
-        )
-    return run
+    return Client(client_config)
 
 
-@dataclass
-class Run:
-    """One recorded session. Record fields have no implicit semantics."""
-
-    _client: Client = field(repr=False)
-    feed: str
-
-    @property
-    def id(self) -> str:
-        return self._client.session_id
-
-    def _emit_run_metadata(
-        self,
-        *,
-        name: Optional[str],
-        config: Mapping[str, Any],
-        tags: list[str],
-        group: Optional[str],
-    ) -> bool:
-        if not self._client.enabled:
-            return False
-        builder = (
-            EventBuilder()
-            .add_optional_string("name", name)
-            .add_string_array("tags", tags)
-            .add_optional_string("group", group)
-            .add_variant("config", dict(config))
-        )
-        fields = builder.build()
-        return self._client.emit_on(self._client.channel("metadata"), "run", fields)
-
-    @overload
-    def log(self, record: Mapping[str, Any], /) -> bool: ...
-
-    @overload
-    def log(self, stream_name: str, record: Mapping[str, Any], /) -> bool: ...
-
-    def log(
-        self,
-        stream_or_record: Union[str, Mapping[str, Any]],
-        record: Optional[Mapping[str, Any]] = None,
-        /,
-    ) -> bool:
-        """Append one native typed row to a stream.
-
-        ``log(record)`` uses the default ``log`` stream;
-        ``log(stream_name, record)`` selects a named stream.
-        Returns ``False`` without inspecting the record when this run is
-        disabled.
-        """
-        if isinstance(stream_or_record, str):
-            if record is None:
-                raise TypeError("log(stream_name, record) requires a record")
-            return self._emit_record(stream_or_record, record, enqueue_timeout=None)
-        if record is not None:
-            raise TypeError("log(record) accepts only one record argument")
-        return self._emit_record("log", stream_or_record, enqueue_timeout=None)
-
-    @overload
-    def log_wait(self, record: Mapping[str, Any], /, *, timeout: float) -> bool: ...
-
-    @overload
-    def log_wait(
-        self,
-        stream_name: str,
-        record: Mapping[str, Any],
-        /,
-        *,
-        timeout: float,
-    ) -> bool: ...
-
-    def log_wait(
-        self,
-        stream_or_record: Union[str, Mapping[str, Any]],
-        record: Optional[Mapping[str, Any]] = None,
-        /,
-        *,
-        timeout: float,
-    ) -> bool:
-        """Wait for queue capacity while appending one native typed row."""
-        if isinstance(stream_or_record, str):
-            if record is None:
-                raise TypeError("log_wait(stream_name, record) requires a record")
-            return self._emit_record(stream_or_record, record, enqueue_timeout=timeout)
-        if record is not None:
-            raise TypeError("log_wait(record) accepts only one record argument")
-        return self._emit_record("log", stream_or_record, enqueue_timeout=timeout)
-
-    def _emit_record(
-        self,
-        schema_name: str,
-        data: Mapping[str, Any],
-        *,
-        enqueue_timeout: Optional[float],
-    ) -> bool:
-        if not self._client.enabled:
-            return False
-        if not isinstance(data, Mapping):
-            raise TypeError("record must be a mapping")
-        builder = EventBuilder()
-        for field_name, value in data.items():
-            builder.add(field_name, value)
-        target = self._client.channel("data")
-        fields = builder.build()
-        if enqueue_timeout is None:
-            return self._client.emit_on(target, schema_name, fields)
-        return self._client.emit_on_wait(target, schema_name, fields, enqueue_timeout)
-
-    def flush(self, timeout: float = 10.0) -> DeliveryReport:
-        """Flush events accepted so far without ending the run."""
-        return self._client.flush(timeout)
-
-    def finish(self, timeout: float = 10.0) -> DeliveryReport:
-        """Flush pending events, stop the worker, and return its delivery report."""
-        report = self._client.shutdown(timeout)
-        if not report.successful:
-            logging.getLogger("feed").warning(
-                "feed: finish incomplete: persisted_pending=%d unsaved=%d failed=%d; spool=%s",
-                report.persisted_pending,
-                report.unsaved,
-                report.failed,
-                report.spool_path,
-            )
-        return report
-
-    def __enter__(self) -> "Run":
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        self.finish()
+def _ingest_destination(ingest_url: str):
+    error = (
+        "ingest_url must be an HTTP(S) URL ending in /v1/<feed> or "
+        "/v1/<feed>/telemetry, without credentials, query or fragment"
+    )
+    try:
+        parsed = urlsplit(ingest_url)
+        parsed.port  # Validate the optional port before starting the worker.
+    except ValueError:
+        raise ValueError(error) from None
+    prefix, separator, endpoint = parsed.path.rstrip("/").rpartition("/v1/")
+    endpoint = endpoint.removesuffix("/telemetry")
+    if (
+        parsed.scheme not in ("http", "https")
+        or not parsed.hostname
+        or parsed.username is not None
+        or parsed.query
+        or parsed.fragment
+        or not separator
+        or not endpoint
+        or "/" in endpoint
+        or endpoint in (".", "..")
+    ):
+        raise ValueError(error)
+    return urlunsplit((parsed.scheme, parsed.netloc, prefix, "", "")), endpoint

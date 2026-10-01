@@ -1,4 +1,4 @@
-"""Internal batching and transport client used by :func:`feed.init`."""
+"""Typed events, session state, dictionary logging, and background delivery."""
 
 from __future__ import annotations
 
@@ -9,13 +9,13 @@ import logging
 import json
 import math
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Mapping, Optional, Union, overload
 
 from .channel import ChannelHandle
 from .config import DEFAULT_CHANNEL, ChannelSettings, Config
 from .delivery import DeliveryReport, DeliveryTracker
 from .errors import ConfigError
-from .fields import Field, FieldType, _infer_field, _normalize_name
+from .fields import EventBuilder, Field, FieldType, _infer_field, _normalize_name
 from .state import StateStore
 from .limits import Admission
 from .spool import SpoolRoot, MAX_RECORD_BYTES
@@ -30,11 +30,10 @@ class Channel:
 
 
 class Client:
-    """Internal client owning queues, delivery tracking, and the HTTP worker.
+    """A Feed session with events, shared state, and delivery tracking.
 
-    Applications should use :func:`feed.init` and :class:`feed.Run`. Keeping the
-    transport behind this boundary lets the public run API stay independent of
-    batching and wire-protocol details.
+    Construct with :class:`Config` for direct endpoint configuration, or use
+    :func:`feed.init` for a saved login or API key.
     """
 
     def __init__(self, config: Config) -> None:
@@ -108,6 +107,16 @@ class Client:
         return self._session_id
 
     @property
+    def id(self) -> str:
+        """The session UUID, also available as :attr:`session_id`."""
+        return self._session_id
+
+    @property
+    def feed(self) -> str:
+        """The selected feed reference, or the directly configured endpoint ID."""
+        return self._config.feed_reference or self._config.endpoint_id
+
+    @property
     def worker_state(self) -> WorkerState:
         """Current worker lifecycle state."""
         return self._worker.state if self._worker is not None else WorkerState.FINISHED
@@ -179,13 +188,92 @@ class Client:
             schema_name, fields, state, timeout
         )
 
+    # --- dictionary logging -----------------------------------------------
+
+    @overload
+    def log(self, record: Mapping[str, Any], /) -> bool: ...
+
+    @overload
+    def log(self, stream_name: str, record: Mapping[str, Any], /) -> bool: ...
+
+    def log(
+        self,
+        stream_or_record: Union[str, Mapping[str, Any]],
+        record: Optional[Mapping[str, Any]] = None,
+        /,
+    ) -> bool:
+        """Append one native typed row to a stream.
+
+        ``log(record)`` uses the default ``log`` stream;
+        ``log(stream_name, record)`` selects a named stream.
+        Each top-level key is a column. Values use inferred types, including
+        typed structs for dictionaries.
+        Returns ``False`` without inspecting the record when this client is
+        disabled.
+        """
+        if isinstance(stream_or_record, str):
+            if record is None:
+                raise TypeError("log(stream_name, record) requires a record")
+            return self._emit_record(stream_or_record, record, enqueue_timeout=None)
+        if record is not None:
+            raise TypeError("log(record) accepts only one record argument")
+        return self._emit_record("log", stream_or_record, enqueue_timeout=None)
+
+    @overload
+    def log_wait(self, record: Mapping[str, Any], /, *, timeout: float) -> bool: ...
+
+    @overload
+    def log_wait(
+        self,
+        stream_name: str,
+        record: Mapping[str, Any],
+        /,
+        *,
+        timeout: float,
+    ) -> bool: ...
+
+    def log_wait(
+        self,
+        stream_or_record: Union[str, Mapping[str, Any]],
+        record: Optional[Mapping[str, Any]] = None,
+        /,
+        *,
+        timeout: float,
+    ) -> bool:
+        """Wait for queue capacity while appending one native typed row."""
+        if isinstance(stream_or_record, str):
+            if record is None:
+                raise TypeError("log_wait(stream_name, record) requires a record")
+            return self._emit_record(stream_or_record, record, enqueue_timeout=timeout)
+        if record is not None:
+            raise TypeError("log_wait(record) accepts only one record argument")
+        return self._emit_record("log", stream_or_record, enqueue_timeout=timeout)
+
+    def _emit_record(
+        self,
+        schema_name: str,
+        data: Mapping[str, Any],
+        *,
+        enqueue_timeout: Optional[float],
+    ) -> bool:
+        if not self.enabled:
+            return False
+        if not isinstance(data, Mapping):
+            raise TypeError("record must be a mapping")
+        builder = EventBuilder()
+        for field_name, value in data.items():
+            builder.add(field_name, value)
+        fields = builder.build()
+        if enqueue_timeout is None:
+            return self.emit(schema_name, fields)
+        return self.emit_wait(schema_name, fields, enqueue_timeout)
+
     # --- state ------------------------------------------------------------
 
     def set_state(self, name: str, value) -> None:
-        """Set a persistent state field, inferring its type (see
-        :meth:`EventBuilder.add`)."""
+        """Set a persistent field, inferring its type from the value."""
         f = _infer_field(name, value)
-        self._state.set(f.name, f.ftype, f.value)
+        self._state.set(f.name, f.ftype, f.value, f.type_descriptor())
 
     def set_state_bool(self, name: str, value: bool) -> None:
         self._state.set(name, FieldType.BOOL, bool(value))
@@ -256,11 +344,24 @@ class Client:
                 return self._worker.shutdown(flush_timeout)
         return DeliveryReport(0, 0, 0, 0, 0, True, False)
 
+    def finish(self, timeout: float = 10.0) -> DeliveryReport:
+        """Flush pending events, stop the worker, and return its delivery report."""
+        report = self.shutdown(timeout)
+        if not report.successful:
+            logging.getLogger("feed").warning(
+                "feed: finish incomplete: persisted_pending=%d unsaved=%d failed=%d; spool=%s",
+                report.persisted_pending,
+                report.unsaved,
+                report.failed,
+                report.spool_path,
+            )
+        return report
+
     def __enter__(self) -> "Client":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.shutdown()
+        self.finish()
 
 
 def _validate(config: Config) -> None:

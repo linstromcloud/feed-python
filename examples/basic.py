@@ -1,14 +1,18 @@
-"""Minimal project-scoped logging example."""
+"""Emit typed events with shared session state."""
 
 import feed
 
 
 def main() -> None:
-    with feed.init(name="basic-example") as run:
-        print("run_id =", run.id)
-        for step, loss in enumerate((1.0, 0.72, 0.51)):
-            run.log("train", {"step": step, "loss": loss})
-        run.log("evaluation", {"split": "held_out", "accuracy": 0.83})
+    with feed.init() as client:
+        print("session_id =", client.session_id)
+        client.set_state("sensor", "room_1")
+        for temperature in (21.0, 21.2, 21.1):
+            client.emit(
+                "readings",
+                feed.EventBuilder().add_float("temperature", temperature).build(),
+            )
+        client.log("status", {"healthy": True})
 
     print("finished and flushed")
 

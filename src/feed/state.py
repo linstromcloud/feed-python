@@ -27,16 +27,16 @@ class StateStore:
         """Cheap reference to the current snapshot, captured at emit time."""
         return self._current
 
-    def set(self, name: str, ftype: FieldType, value) -> None:
+    def set(self, name: str, ftype: FieldType, value, descriptor=None) -> None:
         key = name.lower()
         with self._lock:
             fields = list(self._current)
             for i, f in enumerate(fields):
                 if f.name == key:
-                    fields[i] = Field(key, ftype, value)
+                    fields[i] = Field(key, ftype, value, descriptor)
                     break
             else:
-                fields.append(Field(key, ftype, value))
+                fields.append(Field(key, ftype, value, descriptor))
             self._current = tuple(fields)
 
     def remove(self, name: str) -> None:
