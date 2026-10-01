@@ -168,6 +168,8 @@ def test_full_spool_keeps_memory_bounded_and_reports_unsaved(mock_server):
         assert run.log({"step": 0})
         assert run.log({"step": 1})
         until(lambda: run._worker._spool.counts()["pending"] == 2)
+        root = run._worker._spool.root
+        SpoolRoot(root.path, root.usage())
         accepted = 0
         while accepted < 100 and run.log({"blob": "x" * 500}):
             accepted += 1

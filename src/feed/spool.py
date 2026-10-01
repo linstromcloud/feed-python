@@ -1,7 +1,7 @@
 """Bounded, exclusively owned run spools on a shared filesystem.
 
-Each event is an immutable JSON file. Atomic rename publishes synced records;
-acknowledgement removes them. Retry metadata never changes the event identity.
+Atomic rename publishes synced event batches and delivery checkpoints.
+Retry metadata never changes the event identity.
 A root lock coordinates disk reservations; producers consume reserved credit
 in memory. Filesystems must support process locks, atomic rename and file fsync.
 """
@@ -114,14 +114,18 @@ class SpoolRoot:
             policy = self.path / "budget.json"
             if policy.exists():
                 stored = _read_json(policy)
-                if stored.get("version") != 1:
+                if stored.get("version") not in (1, 2):
                     raise ConfigError("unsupported Feed spool format")
+                if stored["version"] == 1 and not self._legacy_owner_active():
+                    stored["version"] = 2
+                    _json(policy, stored)
+                self.version = stored["version"]
                 if max_bytes is not None and max_bytes != stored["max_bytes"]:
                     if max_bytes < self._usage():
                         raise ConfigError(
                             "max_spool_bytes is below current stored and reserved usage"
                         )
-                    _json(policy, {"version": 1, "max_bytes": max_bytes})
+                    _json(policy, {"version": self.version, "max_bytes": max_bytes})
                     self.max_bytes = max_bytes
                 else:
                     self.max_bytes = stored["max_bytes"]
@@ -129,7 +133,8 @@ class SpoolRoot:
                 self.max_bytes = max_bytes if max_bytes is not None else 1024**3
                 if self.max_bytes < ROOT_OVERHEAD + RUN_OVERHEAD:
                     raise ConfigError("max_spool_bytes must be at least 65536")
-                _json(policy, {"version": 1, "max_bytes": self.max_bytes})
+                self.version = 2
+                _json(policy, {"version": self.version, "max_bytes": self.max_bytes})
 
     @contextmanager
     def locked(self):
@@ -139,12 +144,26 @@ class SpoolRoot:
             policy = self.path / "budget.json"
             if policy.exists():
                 stored = _read_json(policy)
-                if stored.get("version") != 1:
+                if stored.get("version") not in (1, 2):
                     raise ConfigError("unsupported Feed spool format")
                 self.max_bytes = stored["max_bytes"]
+                self.version = stored["version"]
             yield
         finally:
             os.close(fd)
+
+    def _legacy_owner_active(self):
+        for path in self.runs():
+            try:
+                if _read_json(path / "run.json").get("version") != 1:
+                    continue
+            except FileNotFoundError:
+                continue
+            fd = _lock_owner(path)
+            if fd is None:
+                return True
+            os.close(fd)
+        return False
 
     def runs(self, destination=None):
         with os.scandir(self.path) as entries:
@@ -165,6 +184,14 @@ class SpoolRoot:
 
     @staticmethod
     def _stored_usage(path):
+        try:
+            version = _read_json(path / "run.json").get("version")
+        except FileNotFoundError:
+            version = 1
+        if version == 2:
+            from .spool_batch import stored_usage
+
+            return stored_usage(path)
         usage = RUN_OVERHEAD
         for directory, _, names in os.walk(path, followlinks=False):
             for name in names:
@@ -219,14 +246,14 @@ class SpoolRoot:
                 _json(
                     path / "run.json",
                     {
-                        "version": 1,
+                        "version": self.version,
                         "session_id": session_id,
                         "destination": destination,
                     },
                 )
                 _json(path / "quota.json", {"bytes": allocation})
                 _sync_directory(self.path)
-                return RunSpool(
+                return _spool_type(self.version)(
                     self,
                     path,
                     fd,
@@ -249,7 +276,10 @@ class SpoolRoot:
                 return None
             try:
                 metadata = _read_json(path / "run.json")
-                if metadata.get("version") != 1 or metadata["session_id"] != path.name:
+                if (
+                    metadata.get("version") not in (1, 2)
+                    or metadata["session_id"] != path.name
+                ):
                     raise ValueError("invalid Feed run metadata")
                 # Unpublished temporary files belong to the documented
                 # unpersisted crash window. An owner must be absent first.
@@ -257,7 +287,7 @@ class SpoolRoot:
                     entry.unlink()
                 allocation = self._stored_usage(path)
                 _json(path / "quota.json", {"bytes": allocation})
-                return RunSpool(
+                return _spool_type(metadata["version"])(
                     self,
                     path,
                     fd,
@@ -271,7 +301,19 @@ class SpoolRoot:
                 raise
 
 
+def _spool_type(version):
+    if version == 1:
+        return RunSpool
+    from .spool_batch import BatchSpool
+
+    return BatchSpool
+
+
 class RunSpool:
+    batch_limit = 1
+    batch_bytes = 256 * 1024
+    cost = staticmethod(record_cost)
+
     def __init__(
         self, root, path, owner_fd, destination, session_id, allocation, credit
     ):
@@ -292,7 +334,7 @@ class RunSpool:
 
     def reserve(self, size):
         with self._mutex:
-            cost = record_cost(size)
+            cost = self.cost(size)
             if self._closed or cost > self._credit:
                 return False
             self._credit -= cost
@@ -300,7 +342,7 @@ class RunSpool:
 
     def refund(self, size):
         with self._mutex:
-            self._credit += record_cost(size)
+            self._credit += self.cost(size)
 
     def replenish(self, target):
         with self.root.locked(), self._mutex:
@@ -344,6 +386,30 @@ class RunSpool:
         else:
             _atomic(target, payload)
         self._entries[ticket] = (channel, ".event")
+
+    def persist_batch(self, records):
+        ticket, payload, channel = records[0]
+        self.persist(ticket, payload, channel)
+        return 1
+
+    def size(self, ticket):
+        return self._file(ticket).stat().st_size
+
+    def read_batch(self, tickets):
+        for ticket in tickets:
+            with self._file(ticket).open("rb") as handle:
+                yield ticket, handle.read(MAX_RECORD_BYTES + 1)
+
+    def prepare_batch(self, events, blacklist):
+        return {event["ticket"] for event in events if self.prepare(event, blacklist)}
+
+    def ack_batch(self, records):
+        for ticket, channel, size in records:
+            self.ack(ticket, channel, size)
+
+    def fail_batch(self, records):
+        for ticket, reason in records:
+            self.fail(ticket, reason)
 
     def read(self, ticket):
         return _read_json(self._file(ticket), MAX_RECORD_BYTES)

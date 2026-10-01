@@ -1,5 +1,6 @@
 """Batch preparation and outcomes shared by live delivery and feed sync."""
 
+import json
 import logging
 import time
 from collections import Counter
@@ -9,6 +10,7 @@ from .blacklist import Blacklist
 from .config import ChannelSettings
 from .delivery import DELIVERED, DROPPED, FILTERED
 from .transport import Transport, backoff
+from .spool import MAX_RECORD_BYTES
 
 logger = logging.getLogger("feed")
 
@@ -91,18 +93,26 @@ class UploadRun:
     def _load(self, batch):
         events, actions, processed, size = [], [], [], 0
         for ticket in batch.tickets:
-            event_size = self.spool._file(ticket).stat().st_size
-            if events and size + event_size > self.config.upload_batch_bytes:
+            event_size = self.spool.size(ticket)
+            if processed and size + event_size > self.config.upload_batch_bytes:
                 break
             processed.append(ticket)
+            size += event_size
+        for ticket, payload in self.spool.read_batch(processed):
+            event_size = self.spool.size(ticket)
             try:
-                event = self.spool.read(ticket)
+                if len(payload) != event_size or event_size > MAX_RECORD_BYTES:
+                    raise ValueError("invalid spool record size")
+                event = json.loads(payload)
                 if event["ticket"] != ticket or event["channel"] != batch.channel:
                     raise ValueError("event identity differs from spool filename")
                 for key in ("seq", "schema_hash", "schema_def", "data"):
                     event[key]
+                if not isinstance(event["seq"], int) or not isinstance(
+                    event["data"], dict
+                ):
+                    raise ValueError("invalid event sequence or data")
                 event["_spool_size"] = event_size
-                filtered = self.spool.prepare(event, self.blacklist)
             except (ValueError, KeyError, TypeError) as exc:
                 event = {
                     "ticket": ticket,
@@ -113,11 +123,12 @@ class UploadRun:
                 actions.append((event, "failed", DROPPED, reason))
                 self.error(reason)
                 continue
-            if filtered:
+            events.append(event)
+        filtered = self.spool.prepare_batch(events, self.blacklist)
+        for event in events:
+            if event["ticket"] in filtered:
                 actions.append((event, "ack", FILTERED, ""))
-            else:
-                events.append(event)
-                size += event_size
+        events = [event for event in events if event["ticket"] not in filtered]
         for action in actions:
             self._transition(*action)
         if self.once and processed:
@@ -181,10 +192,23 @@ class UploadRun:
 
     def apply_transitions(self):
         # Retrying file cleanup must not settle delivery counters a second time.
-        for ticket, (kind, channel, size, reason) in list(self.transitions.items()):
-            if kind == "ack":
-                self.spool.ack(ticket, channel=channel, size=size)
-            else:
-                self.spool.fail(ticket, reason)
-            del self.transitions[ticket]
+        items = list(self.transitions.items())
+        for offset in range(0, len(items), self.spool.batch_limit):
+            group = items[offset : offset + self.spool.batch_limit]
+            acks = [
+                (ticket, channel, size)
+                for ticket, (kind, channel, size, _) in group
+                if kind == "ack"
+            ]
+            failures = [
+                (ticket, reason)
+                for ticket, (kind, _, _, reason) in group
+                if kind != "ack"
+            ]
+            self.spool.ack_batch(acks)
+            for ticket, _, _ in acks:
+                del self.transitions[ticket]
+            self.spool.fail_batch(failures)
+            for ticket, _ in failures:
+                del self.transitions[ticket]
         self.spool.release_unused()

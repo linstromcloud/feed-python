@@ -48,6 +48,13 @@ def _resolve(destination, timeout):
 
 
 def _counts(path):
+    try:
+        if _read_json(path / "run.json").get("version") == 2:
+            from .spool_batch import counts
+
+            return counts(path)
+    except FileNotFoundError:
+        pass
     result = {"pending": 0, "failed": 0}
     for _, _, files in os.walk(path, followlinks=False):
         for name in files:
@@ -65,8 +72,9 @@ def status(path=None):
         return result
     root = SpoolRoot(path)
     for run_path in root.runs():
-        counts = _counts(run_path)
+        counts = {"pending": 0, "failed": 0}
         try:
+            counts = _counts(run_path)
             metadata = _read_json(run_path / "run.json")
             destination = metadata["destination"]
             item = {
@@ -77,7 +85,7 @@ def status(path=None):
                 or destination.get("endpoint_id"),
                 **counts,
             }
-        except (OSError, ValueError, KeyError) as exc:
+        except (OSError, ValueError, TypeError, KeyError) as exc:
             item = {"path": str(run_path), "error": str(exc), **counts}
         result["runs"].append(item)
         for key in counts:
@@ -147,9 +155,12 @@ def sync_spools(path=None, timeout=30):
                 result["delivered"] += context.totals["delivered"]
                 result["filtered"] += context.totals["filtered"]
                 context.transport.close()
-            counts = _counts(run_path)
-            result["pending"] += counts["pending"]
-            result["failed"] += counts["failed"]
+            try:
+                counts = _counts(run_path)
+                result["pending"] += counts["pending"]
+                result["failed"] += counts["failed"]
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                result["errors"].append(f"{run_path.name}: cannot count records: {exc}")
             if spool is not None:
                 try:
                     spool.close()

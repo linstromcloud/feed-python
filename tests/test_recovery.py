@@ -290,14 +290,14 @@ def test_stalled_storage_bounds_admission_and_reports_unsaved(mock_server, monke
     assert run.flush(5).successful
     entered, release = threading.Event(), threading.Event()
     spool = run._worker._spool
-    original = spool.persist
+    original = spool.persist_batch
 
     def stalled(*args):
         entered.set()
         assert release.wait(5)
-        original(*args)
+        return original(*args)
 
-    monkeypatch.setattr(spool, "persist", stalled)
+    monkeypatch.setattr(spool, "persist_batch", stalled)
     try:
         assert run.log({"blob": "x" * 500})
         assert entered.wait(2)
@@ -363,7 +363,7 @@ def test_transient_disk_failure_retains_unsaved_and_recovers(mock_server, monkey
     )
     assert run.flush(5).successful
     spool = run._worker._spool
-    original = spool.persist
+    original = spool.persist_batch
     fail = threading.Event()
     fail.set()
 
@@ -372,7 +372,7 @@ def test_transient_disk_failure_retains_unsaved_and_recovers(mock_server, monkey
             raise OSError("disk unavailable")
         return original(*args)
 
-    monkeypatch.setattr(spool, "persist", persist)
+    monkeypatch.setattr(spool, "persist_batch", persist)
     try:
         assert run.log({"step": 1})
         until(lambda: bool(run._admission.error))
@@ -414,7 +414,7 @@ def test_ack_cleanup_failure_recovers_without_double_delivery_counts(
         if (
             path == spool.path / "default"
             and fail.is_set()
-            and not list(path.glob("*.event"))
+            and not list(path.glob("*.batch"))
         ):
             observed.set()
             raise OSError("cannot sync acknowledgement cleanup")

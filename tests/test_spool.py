@@ -72,8 +72,8 @@ def test_legacy_retry_timing_does_not_prevent_recovery(tmp_path):
     from feed.blacklist import Blacklist
     from feed.spool import _json
 
-    root = SpoolRoot(tmp_path, 2**20)
-    spool = root.create(DESTINATION, "session-1", 128 * 1024)
+    from test_spool_batches import legacy_run
+
     event = {
         "ticket": 0,
         "seq": 0,
@@ -82,14 +82,15 @@ def test_legacy_retry_timing_does_not_prevent_recovery(tmp_path):
         "data": {},
     }
     payload = json.dumps(event).encode()
-    assert spool.reserve(len(payload))
-    spool.persist(0, payload)
-    _json(spool._file(0, "retry"), {"after": 10**12, "attempts": 9, "wire_seq": 0})
+    legacy_run(tmp_path / "session-1", [(0, payload, "data")])
+    root = SpoolRoot(tmp_path, 2**20)
+    spool = root.claim(tmp_path / "session-1")
+    _json(spool._file(0, "retry"), {"after": 10**12, "attempts": 9, "wire_seq": 9})
     spool.close()
     recovered = root.claim(tmp_path / "session-1")
     assert recovered.ready(10) == [0]
     assert not recovered.prepare(event, Blacklist())
-    assert event["seq"] == 0
+    assert event["seq"] == 9
     recovered.close()
 
 
@@ -147,7 +148,7 @@ def test_retrying_publication_syncs_the_event_directory(tmp_path, monkeypatch):
     synced = []
 
     def fail_after_rename(path):
-        if (path / "00000000000000000000.event").exists():
+        if list(path.glob("*.batch")):
             raise OSError("directory sync unavailable")
         original(path)
 
@@ -182,11 +183,14 @@ def test_shared_budget_updates_reach_existing_writers(tmp_path):
 
 
 def test_quota_counts_metadata_left_by_interrupted_acknowledgement(tmp_path):
+    from test_spool_batches import legacy_run
+    from feed.spool import RUN_OVERHEAD
+
+    legacy_run(tmp_path / "session-1", [(0, b'{"ticket":0}', "default")])
     root = SpoolRoot(tmp_path, 2**20)
-    spool = root.create(DESTINATION, "session-1", 65536)
+    spool = root.claim(tmp_path / "session-1")
     try:
-        empty_usage = root._stored_usage(spool.path)
-        spool.persist(0, b'{"ticket":0}')
+        empty_usage = RUN_OVERHEAD
         from feed.spool import _json
 
         _json(spool._file(0, "retry"), {"wire_seq": 0})

@@ -34,13 +34,14 @@ if not accepted or not report.successful:
     raise RuntimeError("Feed delivery is incomplete")
 ```
 
-The defaults bound encoded queue data to 16 MiB per session and each encoded event,
+The defaults limit each channel queue to 1,024 records,
+encoded queue data to 16 MiB per session and each encoded event,
 including its schema, to 4 MiB. Oversized events return `False` with a warning;
 `log_wait` rejects a completed event that cannot fit without waiting for queue
 capacity. Queued records and records awaiting persistence share the memory
 budget. Size is checked once after construction; type validation and event
 construction can allocate memory before that check. Upload encoding/compression
-and the spool's filename index require additional working memory. These limits
+and the spool's record index require additional working memory. These limits
 do not establish an OS process-memory limit.
 
 The shared spool defaults to 1 GiB at `~/.local/state/feed/spool/`, or under
@@ -54,17 +55,29 @@ bounded memory queue; further calls return `False` when that queue fills.
 records. Persistence preserves channel order. Existing records are never evicted
 to admit new ones.
 
+Persistence groups up to 500 records from one channel into an immutable batch
+of at most 256 KiB; a larger individual record occupies its own batch. Shared
+checkpoints store filtering decisions, retry identities, acknowledgements, and
+failures. The quota reserves space for checkpoint replacements. A partially
+acknowledged batch retains its payload until every record is acknowledged;
+recovery skips the acknowledged records.
+
 Configure these limits when starting a session:
 
 ```python
 client = feed.init(
+    channels=[feed.ChannelSettings("default", queue_capacity=65536)],
     max_spool_bytes=1024**3,
-    memory_queue_bytes=32 * 1024**2,
+    memory_queue_bytes=64 * 1024**2,
     max_event_bytes=8 * 1024**2,
     persist_interval_seconds=1.0,
     persist_threshold_bytes=256 * 1024,
 )
 ```
+
+Size both the channel count and memory byte budget for a burst of records.
+Increasing these limits buffers more input while persistence catches up;
+non-blocking calls still return `False` when either limit is reached.
 
 The event limit must be at most half the queue byte budget and at most 64 MiB.
 An explicit `max_spool_bytes` updates the shared directory's budget under its
@@ -81,7 +94,7 @@ control delivery. Lower numeric channel priorities select waiting uploads first;
 they cannot preempt an in-flight HTTP request.
 
 An HTTP 413 splits a batch. An individually oversized or permanently rejected
-upload remains in a `.failed` file with its error. Later eligible records can
+upload remains in the spool with its error. Later eligible records can
 upload while that record is failed, delayed, or in flight. Overall capacity
 still bounds admission during an outage.
 
@@ -138,12 +151,17 @@ If the server accepts a request but its response is lost, recovery can send it
 again with the same identity. Delivery is at least once; downstream identity
 deduplication handles those repeated attempts.
 
-Feed supports Windows, macOS, and Linux. Spools use immutable event files,
+Feed supports Windows, macOS, and Linux. Spools use immutable event batches,
 atomic replacement, and synced file writes. They store destination metadata
 and an API-key fingerprint, never access tokens, refresh tokens, or API keys.
 Process coordination uses Windows byte-range locks or POSIX `flock`. A shared
 filesystem must support these locks, atomic replacement, and file `fsync`;
 validate these semantics on the cluster's actual shared filesystem.
+
+Spool format 2 supports batched storage. Recovery also reads format 1. A shared
+spool upgrades when no format 1 session owns it; active format 1 sessions keep
+that root on format 1. Clients that only support format 1 reject an upgraded
+root. Use separate spool directories when running those client versions together.
 
 POSIX writes also sync parent directories. Windows supports recovery after a
 process exits; directory changes are not explicitly synced, so recent creates,

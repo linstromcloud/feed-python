@@ -32,7 +32,6 @@ def test_unexplained_server_drop_drains_spool_and_merges_rules(mock_server, capl
         assert report.successful
         assert report.delivered == 1
         assert report.filtered == report.pending == 0
-        assert status()["pending"] == 0
 
         assert client.log("events", {"kind": "future"})
         report = client.flush(2)
@@ -40,6 +39,7 @@ def test_unexplained_server_drop_drains_spool_and_merges_rules(mock_server, capl
         assert report.filtered == 1
         assert report.delivered == 0
 
+    assert status()["pending"] == 0
     assert len(server.attempts) == 1
     assert "unexplained server drops=1" in caplog.text
 

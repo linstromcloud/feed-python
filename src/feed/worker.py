@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import deque
 import enum
 import logging
 import queue
@@ -10,7 +11,6 @@ import time
 
 from .uploader import UploadRun
 from .transport import Outcome, Transport, backoff
-from .spool import record_cost
 
 logger = logging.getLogger("feed")
 
@@ -188,37 +188,57 @@ class Worker:
                 size += len(event.payload)
         try:
             needed = sum(
-                record_cost(len(e.payload))
+                self._spool.cost(len(e.payload))
                 for e in self._pending_writes
                 if not e.reserved
             )
             if needed:
                 self._spool.replenish(needed)
             remaining = []
+            pending = deque(self._pending_writes)
             blocked_channels = set()
-            for index, event in enumerate(self._pending_writes):
+            while pending:
                 if self._stop.is_set() and time.monotonic() >= self._deadline:
-                    remaining.extend(self._pending_writes[index:])
+                    remaining.extend(pending)
                     break
-                if event.channel in blocked_channels:
-                    remaining.append(event)
+                channel = pending[0].channel
+                if channel in blocked_channels:
+                    remaining.append(pending.popleft())
                     continue
-                if not event.reserved:
-                    event.reserved = self._spool.reserve(len(event.payload))
-                if not event.reserved:
-                    # Keep filtering/sequence checkpoints in channel order.
-                    blocked_channels.add(event.channel)
-                    remaining.append(event)
+                group, size = [], 0
+                while (
+                    pending
+                    and pending[0].channel == channel
+                    and len(group) < self._spool.batch_limit
+                ):
+                    event = pending[0]
+                    if group and size + len(event.payload) > min(
+                        self._config.persist_threshold_bytes, self._spool.batch_bytes
+                    ):
+                        break
+                    if not event.reserved:
+                        event.reserved = self._spool.reserve(len(event.payload))
+                    if not event.reserved:
+                        blocked_channels.add(channel)
+                        break
+                    group.append(pending.popleft())
+                    size += len(event.payload)
+                if not group:
                     continue
                 try:
-                    self._spool.persist(
-                        event.delivery_ticket, event.payload, event.channel
+                    count = self._spool.persist_batch(
+                        [
+                            (event.delivery_ticket, event.payload, event.channel)
+                            for event in group
+                        ]
                     )
                 except OSError:
-                    self._pending_writes = remaining + self._pending_writes[index:]
+                    self._pending_writes = remaining + group + list(pending)
                     raise
-                self._delivery.persisted(event.delivery_ticket)
-                self._admission.release(len(event.payload))
+                for event in group[:count]:
+                    self._delivery.persisted(event.delivery_ticket)
+                    self._admission.release(len(event.payload))
+                pending.extendleft(reversed(group[count:]))
             self._pending_writes = remaining
             self._spool.release_unused()
             blocked = any(not e.reserved for e in remaining)
