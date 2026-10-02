@@ -48,6 +48,7 @@ class DeliveryTracker:
         self._next_ticket = 0
         self._boundary = None
         self._current, self._later = Counter(), Counter()
+        self._completed = Counter()
         self.spool_path = ""
         self.storage_error = ""
 
@@ -96,6 +97,29 @@ class DeliveryTracker:
         c = self._current
         return c["accepted"] - c[DELIVERED] - c[FILTERED] - c[DROPPED]
 
+    def _report(self, counts):
+        pending = (
+            counts["accepted"] - counts[DELIVERED] - counts[FILTERED] - counts[DROPPED]
+        )
+        return DeliveryReport(
+            counts["accepted"],
+            counts[DELIVERED],
+            counts[FILTERED],
+            counts[DROPPED],
+            pending,
+            pending == 0,
+            pending != 0,
+            pending - counts["unsaved"],
+            counts["unsaved"],
+            self.spool_path,
+            self.storage_error,
+        )
+
+    def snapshot(self):
+        """Return cumulative session counts without consuming a flush report."""
+        with self._condition:
+            return self._report(self._completed + self._current + self._later)
+
     def wait(self, watermark, timeout):
         deadline = time.monotonic() + max(0, timeout)
         with self._condition:
@@ -104,22 +128,9 @@ class DeliveryTracker:
                 if remaining <= 0:
                     break
                 self._condition.wait(remaining)
-            c = self._current
-            pending = self._pending()
-            report = DeliveryReport(
-                c["accepted"],
-                c[DELIVERED],
-                c[FILTERED],
-                c[DROPPED],
-                pending,
-                pending == 0,
-                pending != 0,
-                pending - c["unsaved"],
-                c["unsaved"],
-                self.spool_path,
-                self.storage_error,
-            )
-            if not pending:
+            report = self._report(self._current)
+            if report.complete:
+                self._completed.update(self._current)
                 self._current, self._later = self._later, Counter()
                 self._boundary = None
             return report

@@ -69,7 +69,7 @@ class ChannelHandle:
 
         now = time.monotonic()
         if now - self._last_warning >= 1:
-            logging.getLogger("feed").warning("feed: %s; record rejected", message)
+            logging.getLogger("feed").warning("[feed] %s; record rejected", message)
             self._last_warning = now
 
     def _emit(self, schema_name, event_fields, state, timeout):

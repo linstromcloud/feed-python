@@ -108,7 +108,7 @@ print(json.dumps({"id": run.id, "report": dataclasses.asdict(run.finish(.3))}))
         [sys.executable, "-c", script, url], capture_output=True, text=True, timeout=5
     )
     assert process.returncode == 0, process.stderr
-    saved = json.loads(process.stdout)
+    saved = json.loads(process.stdout.splitlines()[-1])
     assert saved["report"]["persisted_pending"] == 5
     assert saved["report"]["unsaved"] == 0
     assert status()["pending"] == 5

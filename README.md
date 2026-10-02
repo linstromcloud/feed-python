@@ -26,7 +26,7 @@ python -m pip install "feed-python @ git+https://github.com/linstromcloud/feed-p
 
 ## API usage
 
-A feed is a logging destination inside a project. `feed.init()` starts a `Client` that owns state, channels, and background delivery. The context manager calls `finish()` on exit.
+A feed is a logging destination inside a project. `feed.init()` starts a `Client` that owns state, channels, and background delivery, and prints its session ID. The context manager calls `finish()` on exit.
 
 ```python
 import feed
@@ -110,7 +110,9 @@ Parquet stores values by column and can encode repeated values with dictionaries
 - `worker_state`: `INITIALIZING`, `FETCHING_BLACKLIST`, `RUNNING`, or `FINISHED`.
 - `emit` and `log` return `True` when an event enters the memory queue. Disabled or stopped clients, invalid channel handles, full queues, rate limits, and oversized events return `False`. Invalid names and values raise exceptions.
 - `emit_wait` and `log_wait` wait for queue capacity up to the supplied timeout.
-- `flush(timeout=10)` waits for accepted events. `finish(timeout=10)` also stops admission and shuts down the worker.
+- `flush(timeout=10)` waits for accepted events. `finish()` stops admission and waits for pending delivery before shutting down the worker. Pass `timeout` to bound the wait, or press Ctrl+C to cancel.
+
+Client messages use the `[feed]` prefix. `finish()` prints delivered records and any nonzero filtered, failed, pending-on-disk, or unsaved counts, including records reported by earlier `flush()` calls.
 
 The worker saves events to disk before uploading. A crash can lose events still in memory. Check the delivery report when delivery matters:
 

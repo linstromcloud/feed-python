@@ -126,7 +126,7 @@ class Transport:
                     if matched > dropped:
                         filtered.clear()
                     logger.warning(
-                        "feed: unexplained server drops=%d (dropped=%d, rule_matches=%d)",
+                        "[feed] unexplained server drops=%d (dropped=%d, rule_matches=%d)",
                         dropped - len(filtered),
                         dropped,
                         matched,

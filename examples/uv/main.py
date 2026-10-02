@@ -7,7 +7,6 @@ import feed
 
 def main() -> None:
     with feed.init() as client:
-        print("session_id =", client.session_id)
         client.set_state("sensor", "room_1")
         client.log(
             "devices",
@@ -21,8 +20,6 @@ def main() -> None:
         for temperature in (21.0, 21.2, 21.1):
             client.log("readings", {"temperature": temperature})
         client.log("status", {"healthy": True})
-
-    print("finished and flushed")
 
 
 if __name__ == "__main__":

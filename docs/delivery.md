@@ -13,7 +13,9 @@ filtering rules do not stop local persistence.
 A crash can lose records still awaiting persistence. The interval is a target,
 not a maximum loss window: slow or failed storage can extend it. The context
 manager calls `finish()` to save queued records and wait for delivery before
-the process exits:
+the process exits. The default wait has no deadline. When work remains, the
+client prints `[feed] Syncing remaining feeds, cancel with Ctrl+C.` to stdout.
+Set a timeout to bound the wait:
 
 ```python
 report = client.finish(timeout=30)
@@ -23,6 +25,13 @@ if not report.successful:
         f"unsaved={report.unsaved}, failed={report.failed}"
     )
 ```
+
+Enabled clients print their session ID on initialization. Client messages use
+the `[feed]` prefix. `finish()` prints a final status and delivered records, adding
+filtered, failed, pending-on-disk, and unsaved counts when nonzero. These counts
+include earlier completed `flush()` calls and exclude records recovered from
+other sessions. Ctrl+C prints the available counts with a cancelled status.
+Disabled clients remain quiet.
 
 For producers that must apply backpressure, use `emit_wait` or `log_wait`, then
 inspect `flush()` before advancing the source cursor:
@@ -99,9 +108,15 @@ upload while that record is failed, delayed, or in flight. Overall capacity
 still bounds admission during an outage.
 
 `flush()` waits for the records admitted before its call. `finish()` closes
-admission, prioritizes persistence, and waits for uploads within its deadline.
-If disk writes cannot finish within that time, `unsaved` reports the remaining
-memory records. A stalled filesystem call may continue in the daemon worker.
+admission, prioritizes persistence, and waits for pending uploads and matching
+recovery sessions. An explicit timeout limits that wait. Ctrl+C cancels it and
+propagates `KeyboardInterrupt`; a Ctrl+C inside the context also cancels exit
+delivery. Persisted records remain recoverable. Permanently rejected records
+remain failed and do not extend the wait.
+
+If delivery stops before disk writes finish, `unsaved` reports the remaining
+memory records when a report is returned. Cancellation can lose these records
+on process exit. A stalled filesystem call may continue in the daemon worker.
 Reports distinguish `delivered`, `filtered`, `failed`, `persisted_pending`, and
 `unsaved`; `pending` includes both persisted and unsaved records. `dropped`
 aliases `failed`. A successful report requires remote acknowledgement or

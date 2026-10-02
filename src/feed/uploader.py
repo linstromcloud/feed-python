@@ -50,7 +50,7 @@ class UploadRun:
     def error(self, reason):
         if reason != self.last_error:
             logger.warning(
-                "feed: %s; pending records retained in %s", reason, self.spool.path
+                "[feed] %s; pending records retained in %s", reason, self.spool.path
             )
         self.last_error = reason
 
@@ -158,7 +158,7 @@ class UploadRun:
                 )
             )
             logger.info(
-                "feed: splitting oversized batch events=%d into %d and %d",
+                "[feed] splitting oversized batch events=%d into %d and %d",
                 len(batch.tickets),
                 middle,
                 len(batch.tickets) - middle,
@@ -173,7 +173,7 @@ class UploadRun:
         if outcome.kind == "success":
             self.blacklist.merge_rules(outcome.rules)
             if self.last_error:
-                logger.info("feed: delivery recovered for %s", self.spool.session_id)
+                logger.info("[feed] delivery recovered for %s", self.spool.session_id)
                 self.last_error = ""
         else:
             self.error(outcome.reason)

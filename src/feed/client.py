@@ -98,6 +98,7 @@ class Client:
                 self._wake,
             )
             self._worker.start()
+            print(f"[feed] Session: {self._session_id}", flush=True)
 
     # --- introspection ----------------------------------------------------
 
@@ -344,12 +345,24 @@ class Client:
                 return self._worker.shutdown(flush_timeout)
         return DeliveryReport(0, 0, 0, 0, 0, True, False)
 
-    def finish(self, timeout: float = 10.0) -> DeliveryReport:
-        """Flush pending events, stop the worker, and return its delivery report."""
-        report = self.shutdown(timeout)
+    def finish(self, timeout: Optional[float] = None) -> DeliveryReport:
+        """Wait for pending delivery and stop the worker.
+
+        An explicit timeout bounds the wait. Ctrl+C cancels it and leaves
+        persisted records available for recovery.
+        """
+        if self._worker is None:
+            return self.shutdown(0)
+        with self._flush_lock:
+            try:
+                report = self._worker.shutdown(timeout, announce=True)
+            except KeyboardInterrupt:
+                self._print_finish_status(cancelled=True)
+                raise
+            self._print_finish_status()
         if not report.successful:
             logging.getLogger("feed").warning(
-                "feed: finish incomplete: persisted_pending=%d unsaved=%d failed=%d; spool=%s",
+                "[feed] finish incomplete: persisted_pending=%d unsaved=%d failed=%d; spool=%s",
                 report.persisted_pending,
                 report.unsaved,
                 report.failed,
@@ -357,11 +370,33 @@ class Client:
             )
         return report
 
+    def _print_finish_status(self, *, cancelled=False):
+        if self._worker is None:
+            return
+        report = self._delivery.snapshot()
+        status = "cancelled" if cancelled else (
+            "complete" if report.successful else "incomplete"
+        )
+        counts = [f"{report.delivered} delivered"]
+        for count, label in (
+            (report.filtered, "filtered"),
+            (report.failed, "failed"),
+            (report.persisted_pending, "pending on disk"),
+            (report.unsaved, "unsaved"),
+        ):
+            if count:
+                counts.append(f"{count} {label}")
+        print(f"[feed] {status.capitalize()}: {', '.join(counts)}.", flush=True)
+
     def __enter__(self) -> "Client":
         return self
 
     def __exit__(self, exc_type, exc, tb) -> None:
-        self.finish()
+        if exc_type is not None and issubclass(exc_type, KeyboardInterrupt):
+            self.shutdown(0)
+            self._print_finish_status(cancelled=True)
+        else:
+            self.finish()
 
 
 def _validate(config: Config) -> None:
@@ -406,5 +441,5 @@ def _validate(config: Config) -> None:
             raise ConfigError(f"{name} must be positive")
     if config.max_retries != 0 or config.max_retry_queue_depth != 0:
         logging.getLogger("feed").debug(
-            "feed: durable storage retains retries; legacy retry count/depth limits do not discard events"
+            "[feed] durable storage retains retries; legacy retry count/depth limits do not discard events"
         )

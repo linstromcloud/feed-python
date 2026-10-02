@@ -32,6 +32,8 @@ class Worker:
         self._recoveries = iter(spool.root.runs(spool.destination))
         self._state = WorkerState.INITIALIZING
         self._stop = threading.Event()
+        self._finished = threading.Event()
+        self._announce_finish = False
         self._flush_requested = threading.Event()
         self._deadline = float("inf")
         self._results = queue.Queue()
@@ -59,14 +61,28 @@ class Worker:
         self._wake.set()
         return self._delivery.wait(watermark, timeout)
 
-    def shutdown(self, flush_timeout):
+    def shutdown(self, flush_timeout, *, announce=False):
         self._admission.stop()
         watermark = self._delivery.watermark()
-        if not self._stop.is_set():
-            self._deadline = time.monotonic() + max(0, flush_timeout)
-            self._stop.set()
+        deadline = (
+            float("inf")
+            if flush_timeout is None
+            else time.monotonic() + max(0, flush_timeout)
+        )
+        self._deadline = min(self._deadline, deadline)
+        self._announce_finish = announce
+        self._stop.set()
         self._wake.set()
-        self._thread.join(timeout=max(0, flush_timeout) + 0.1)
+        try:
+            while not self._finished.is_set():
+                remaining = deadline + 0.1 - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._finished.wait(min(0.1, remaining))
+        except KeyboardInterrupt:
+            self._deadline = time.monotonic()
+            self._wake.set()
+            raise
         return self._delivery.wait(watermark, 0)
 
     def _submit(self, context, kind, batch=None):
@@ -120,18 +136,19 @@ class Worker:
                 self._persist(force)
                 self._poll_results()
                 self._apply_transitions()
-                now = time.monotonic()
-                if self._stop.is_set():
-                    if now >= self._deadline:
-                        break
-                    if (
-                        self._admission.used == 0
-                        and self._jobs == 0
-                        and not any(c.transitions for c in self._contexts)
-                        and not any(c.spool.counts()["pending"] for c in self._contexts)
-                    ):
-                        break
+                if self._stop.is_set() and time.monotonic() >= self._deadline:
+                    break
                 self._adopt_recoveries()
+                if self._stop.is_set():
+                    pending = self._admission.used or any(
+                        c.transitions or c.spool.counts()["pending"]
+                        for c in self._contexts
+                    )
+                    if not pending and self._jobs == 0:
+                        break
+                    if pending and self._announce_finish:
+                        print("[feed] Syncing remaining feeds, cancel with Ctrl+C.", flush=True)
+                        self._announce_finish = False
                 try:
                     self._dispatch()
                     self._clear_storage_error("dispatch")
@@ -141,23 +158,26 @@ class Worker:
                 self._wake.clear()
         except Exception as exc:
             self._storage_error(exc)
-            logger.exception("feed: worker stopped; durable records remain recoverable")
+            logger.exception("[feed] worker stopped; durable records remain recoverable")
         finally:
-            self._admission.stop()
-            for _ in self._http_threads:
-                self._requests.put(None)
-            for context in self._contexts:
-                try:
-                    context.spool.close()
-                except OSError as exc:
-                    self._storage_error(exc)
-            self._state = WorkerState.FINISHED
+            try:
+                self._admission.stop()
+                for _ in self._http_threads:
+                    self._requests.put(None)
+                for context in self._contexts:
+                    try:
+                        context.spool.close()
+                    except OSError as exc:
+                        self._storage_error(exc)
+            finally:
+                self._state = WorkerState.FINISHED
+                self._finished.set()
 
     def _storage_error(self, exc, key="worker"):
         reason = str(exc)
         self._storage_errors[key] = reason
         if reason != self._delivery.storage_error:
-            logger.error("feed: persistence error: %s", reason)
+            logger.error("[feed] persistence error: %s", reason)
         self._delivery.storage_error = reason
         self._admission.storage_error(reason)
 
@@ -244,7 +264,7 @@ class Worker:
             blocked = any(not e.reserved for e in remaining)
             if blocked and not self._quota_blocked:
                 logger.warning(
-                    "feed: spool quota exhausted; queued records remain in bounded memory"
+                    "[feed] spool quota exhausted; queued records remain in bounded memory"
                 )
             self._quota_blocked = blocked
             self._last_persist = now
@@ -253,8 +273,6 @@ class Worker:
             self._storage_error(exc, "persist")
 
     def _adopt_recoveries(self):
-        if self._stop.is_set():
-            return
         for context in list(self._contexts):
             if (
                 context is not self._current
@@ -286,7 +304,7 @@ class Worker:
                     recovered.close()
                     recovered = None
             except (OSError, ValueError, TypeError, KeyError) as exc:
-                logger.error("feed: cannot recover %s: %s", path, exc)
+                logger.error("[feed] cannot recover %s: %s", path, exc)
             finally:
                 if recovered is not None:
                     recovered.close()

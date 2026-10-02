@@ -96,7 +96,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 for item in report.get("runs", []):
                     print(json.dumps(item))
                 for error in report.get("errors", []):
-                    print(f"feed: {error}", file=sys.stderr)
+                    print(f"[feed] {error}", file=sys.stderr)
             return int(
                 args.command == "sync"
                 and bool(
@@ -114,7 +114,7 @@ def main(argv: Optional[List[str]] = None) -> int:
             return _use(args.feed)
         raise AssertionError(f"unhandled command: {args.command}")
     except (AuthError, OSError, ValueError) as exc:
-        parser.exit(1, f"feed: {exc}\n")
+        parser.exit(1, f"[feed] {exc}\n")
 
 
 def _login(args: argparse.Namespace) -> int:
